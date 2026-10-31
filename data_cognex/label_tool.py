@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat, ImageTk
 
 from label_obb import Box, atomic_write, decode, encode
 
@@ -62,7 +62,11 @@ def otsu_threshold(image, mask):
 
 
 def character_asset(source, box):
-    """Extract dark foreground inside one OBB and return RGB crop plus alpha."""
+    """Return the print inside one OBB as a paper-relative shade map.
+
+    The map is 255 on paper and sample/paper on ink, so multiplying it onto a
+    background keeps the real ink tone, dot texture and soft edges.
+    """
     corners = box.corners()
     padding = 12
     left = max(0, math.floor(min(x for x, _ in corners)) - padding)
@@ -74,16 +78,33 @@ def character_asset(source, box):
     polygon = [(x - left, y - top) for x, y in corners]
     roi = Image.new("L", crop.size, 0)
     ImageDraw.Draw(roi).polygon(polygon, fill=255)
+    # Bỏ 2 px sát cạnh box: mép nhãn/bóng đổ chạm cạnh box không phải là mực.
+    inner = roi.filter(ImageFilter.MinFilter(5))
+    if inner.getbbox():
+        roi = inner
     threshold = otsu_threshold(gray, roi)
-    low, high = max(0, threshold - 6), min(255, threshold + 6)
-    high = max(high, low + 1)
-    table = [255 if value <= low else 0 if value >= high
-             else round((high - value) * 255 / (high - low)) for value in range(256)]
-    alpha = ImageChops.multiply(gray.point(table), roi)
-    alpha = alpha.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
-    alpha = ImageChops.multiply(alpha.filter(ImageFilter.GaussianBlur(.45)), roi)
-    ink = Image.new("RGB", crop.size, (0, 0, 0))
-    return ink, alpha, (left, top)
+    paper_mask = ImageChops.multiply(
+        gray.point([0 if value <= threshold else 255 for value in range(256)]), roi)
+    ink_mask = ImageChops.multiply(
+        gray.point([255 if value <= threshold else 0 for value in range(256)]), roi)
+    white = Image.new("RGB", crop.size, (255, 255, 255))
+    if not paper_mask.getbbox() or not ink_mask.getbbox():
+        return white, (left, top)
+    paper = ImageStat.Stat(crop, paper_mask).mean
+    paper_level = ImageStat.Stat(gray, paper_mask).mean[0]
+    ink_level = ImageStat.Stat(gray, ink_mask).mean[0]
+    shade = Image.merge("RGB", [
+        channel.point([min(255, round(value * 255 / max(1.0, level))) for value in range(256)])
+        for channel, level in zip(crop.split(), paper)])
+    # Cổng mềm chỉ để loại nhiễu giấy; độ đậm thật lấy từ shade nên chấm in và
+    # viền mềm không bị nhị phân hóa, không dồn thành nét đặc.
+    contrast = max(1.0, paper_level - ink_level)
+    start, end = paper_level - contrast * .15, paper_level - contrast * .3
+    table = [255 if value <= end else 0 if value >= start
+             else round((start - value) * 255 / (start - end)) for value in range(256)]
+    gate = gray.point(table).filter(ImageFilter.MaxFilter(3))
+    gate = ImageChops.multiply(gate.filter(ImageFilter.GaussianBlur(.6)), roi)
+    return Image.composite(shade, white, gate), (left, top)
 
 
 def split_rows(boxes):
@@ -699,18 +720,17 @@ class SyntheticLabelTool:
                   if index not in self.deleted_indices]
         self.preview_source_indices = [index for index, _, _ in active]
         for _, source_box, target_box in active:
-            ink, alpha, origin = character_asset(self.sample_image, source_box)
+            shade, origin = character_asset(self.sample_image, source_box)
             object_scale = target_box.w / source_box.w
             if not math.isclose(object_scale, 1.0, abs_tol=1e-9):
-                resized = (max(1, round(ink.width * object_scale)),
-                           max(1, round(ink.height * object_scale)))
-                ink = ink.resize(resized, Image.Resampling.BICUBIC)
-                alpha = alpha.resize(resized, Image.Resampling.BILINEAR)
+                resized = (max(1, round(shade.width * object_scale)),
+                           max(1, round(shade.height * object_scale)))
+                shade = shade.resize(resized, Image.Resampling.BICUBIC)
             angle_delta = target_box.angle - source_box.angle
             crop_center_offset = (
-                (origin[0] + (ink.width / object_scale) / 2 - source_box.cx)
+                (origin[0] + (shade.width / object_scale) / 2 - source_box.cx)
                 * object_scale,
-                (origin[1] + (ink.height / object_scale) / 2 - source_box.cy)
+                (origin[1] + (shade.height / object_scale) / 2 - source_box.cy)
                 * object_scale,
             )
             cosine, sine = math.cos(angle_delta), math.sin(angle_delta)
@@ -720,18 +740,18 @@ class SyntheticLabelTool:
             )
             if abs(angle_delta) > 1e-9:
                 degrees = -math.degrees(angle_delta)
-                ink = ink.rotate(degrees, resample=Image.Resampling.BICUBIC, expand=True)
-                alpha = alpha.rotate(degrees, resample=Image.Resampling.BILINEAR, expand=True)
+                shade = shade.rotate(degrees, resample=Image.Resampling.BICUBIC,
+                                     expand=True, fillcolor=(255, 255, 255))
             if mode == "blur":
-                alpha = alpha.filter(ImageFilter.GaussianBlur(
+                shade = shade.filter(ImageFilter.GaussianBlur(
                     max(.2, float(self.blur_radius.get()))))
-            x = round(target_box.cx + rotated_offset[0] - ink.width / 2)
-            y = round(target_box.cy + rotated_offset[1] - ink.height / 2)
-            layer_mask = Image.new("L", canvas.size, 0)
-            layer_mask.paste(alpha, (x, y))
-            layer_mask = ImageChops.multiply(layer_mask, cut_mask)
-            layer = Image.new("RGB", canvas.size, (0, 0, 0))
-            canvas.paste(layer, (0, 0), layer_mask)
+            x = round(target_box.cx + rotated_offset[0] - shade.width / 2)
+            y = round(target_box.cy + rotated_offset[1] - shade.height / 2)
+            # Nhân shade (255 = giấy) lên background thay vì dán màu đen: giữ tông
+            # mực thật của ảnh mẫu và theo ánh sáng tại vị trí đặt.
+            layer = Image.new("RGB", canvas.size, (255, 255, 255))
+            layer.paste(shade, (x, y))
+            canvas.paste(ImageChops.multiply(canvas, layer), (0, 0), cut_mask)
         return canvas, [target_box for _, _, target_box in active]
 
     def show_preview(self):
