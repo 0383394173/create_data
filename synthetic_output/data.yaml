@@ -1,5 +1,0 @@
-path: "D:/data_cognex/synthetic_output"
-train: images
-nc: 1
-names:
-  0: date
