@@ -1,0 +1,5 @@
+path: "D:/data_cognex/data_create"
+train: images
+nc: 1
+names:
+  0: date
