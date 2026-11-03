@@ -31,17 +31,19 @@
     "count_mode": "per_mode",
     "modes": [
       "auto_spacing",
-      "auto_overlap",
-      "auto_blur",
       "auto_cut_row_1",
       "auto_cut_row_2",
-      "auto_cut_both_rows",
-      "auto_delete_objects"
+      "auto_delete_objects",
+      "auto_out_line"
     ],
     "modes_unchecked": [
-      "auto_arc"
+      "auto_overlap",
+      "auto_arc",
+      "auto_blur",
+      "auto_cut_both_rows"
     ],
     "val_percent": 0,
-    "size_mode": "image"
+    "size_mode": "image",
+    "angle_jitter_deg": 15.4
   }
 }

@@ -34,13 +34,15 @@ CUT_SIDES = ("above", "below")
 AUTO_ERROR_MODES = (
     "spacing", "overlap", "arc", "blur",
     "cut_row_1", "cut_row_2", "cut_both_rows",
-    "delete_objects",
+    "delete_objects", "out_line",
 )
 # Saved effect states use format 2: cut lines are stored relative to the date
 # (see local_to_image) and index-based data is tied to a sample via box_refs.
 STATE_VERSION = 2
 JITTER_SHIFT = .018      # placement jitter, fraction of the region size
-JITTER_ANGLE = .025      # placement jitter, radians
+JITTER_ANGLE = .025      # default placement jitter, radians (±1.43°)
+JITTER_ANGLE_DEG = round(math.degrees(JITTER_ANGLE), 2)
+MAX_JITTER_ANGLE_DEG = 45.0
 MAX_ATTEMPTS = 100
 MIN_PRINT_CONTRAST = 10  # grey levels between paper and ink
 REGION_FILL = .85        # "Cỡ ký tự theo vùng": date fills this much of the region
@@ -50,6 +52,18 @@ SECONDS_PER_PIXEL = .060 / (1920 * 480)
 CONFIRM_ABOVE = 20000    # ask before generating more images than this
 MANIFEST_FIELDS = ("image", "split", "code", "background", "mode", "variant", "seed")
 MAX_PATH_LENGTH = 259    # Windows MAX_PATH without the terminating NUL
+OUT_LINES_VERSION = 1
+
+
+def angle_jitter_radians(degrees):
+    """The ± rotation range in radians for a setting in degrees.
+
+    The default (shown rounded as 1.43°) maps to exactly JITTER_ANGLE, so runs
+    with the default keep making the same images for the same seed.
+    """
+    if abs(degrees - JITTER_ANGLE_DEG) < 1e-9:
+        return JITTER_ANGLE
+    return math.radians(degrees)
 
 
 def auto_job_name(mode):
@@ -467,8 +481,19 @@ def line_crosses_box(line, box, tolerance=1e-6):
         return False
 
     # Also require the segment the user actually drew (not its infinite
-    # extension) to enter the rotated box. Transform it to box-local space and
-    # clip it against the resulting axis-aligned rectangle.
+    # extension) to enter the rotated box.
+    return segment_hits_box(line, box, tolerance)
+
+
+def segment_hits_box(line, box, tolerance=1e-6):
+    """Return True when a segment touches or enters an OBB.
+
+    The segment is moved to box-local space and clipped against the resulting
+    axis-aligned rectangle (Liang–Barsky).
+    """
+    if not line:
+        return False
+    (x1, y1), (x2, y2) = line
     cosine, sine = math.cos(box.angle), math.sin(box.angle)
 
     def local(x, y):
@@ -500,6 +525,57 @@ def line_crosses_box(line, box, tolerance=1e-6):
 # region centre (where the date is centred), in sample pixels. They follow the
 # region when it moves or is jittered, and keep their position relative to the
 # characters on any background.
+def out_line_hits(boxes, lines):
+    """Indices of the boxes that touch an out-line.
+
+    This is the "out" rule: a date is out when any of its characters overlaps
+    a line drawn on the background. Lines are in image pixels.
+    """
+    if not lines:
+        return []
+    return [index for index, box in enumerate(boxes)
+            if any(segment_hits_box(line, box) for line in lines)]
+
+
+def read_out_lines(path, size):
+    """Out-lines stored for an image of ``size``, in pixels ([] if none).
+
+    The file holds ``{"version": 1, "lines": [[[x1, y1], [x2, y2]], ...]}``
+    with coordinates relative to the image size (0–1), like YOLO labels, so
+    it can be copied to another image with the same framing.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8-sig").strip()
+    if not text:
+        return []
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("lines"), list):
+        raise ValueError("file đường out-line phải có danh sách 'lines'")
+    width, height = size
+    lines = []
+    for item in data["lines"]:
+        try:
+            (x1, y1), (x2, y2) = item
+            values = [float(value) for value in (x1, y1, x2, y2)]
+        except (TypeError, ValueError):
+            raise ValueError(f"đường out-line không hợp lệ: {item!r:.60}") from None
+        if not all(math.isfinite(value) and -1e-6 <= value <= 1 + 1e-6 for value in values):
+            raise ValueError("tọa độ đường out-line phải nằm trong 0–1")
+        lines.append(((values[0] * width, values[1] * height),
+                      (values[2] * width, values[3] * height)))
+    return lines
+
+
+def encode_out_lines(lines, size):
+    """JSON text for ``read_out_lines``; pixel lines → 0–1 coordinates."""
+    width, height = size
+    return json.dumps({"version": OUT_LINES_VERSION, "lines": [
+        [[round(max(0.0, min(1.0, x / width)), 8), round(max(0.0, min(1.0, y / height)), 8)]
+         for x, y in line] for line in lines]}, indent=2) + "\n"
+
+
 def local_to_image(point, region, scale):
     x, y = point[0] * scale, point[1] * scale
     cosine, sine = math.cos(region.angle), math.sin(region.angle)
@@ -638,6 +714,7 @@ class Composition:
     sources: list = field(default_factory=list)  # sample-box index of each label
     blank: list = field(default_factory=list)    # sample boxes without visible print
     cut_count: int = 0                           # objects crossed by a cut line
+    out_hits: list = field(default_factory=list)  # labels touching an out-line
 
 
 # ------------------------------------------------------------------ code, target
@@ -681,6 +758,7 @@ class Target:
     path: Path | None
     image: Image.Image | None
     region: Box | None
+    out_lines: list = field(default_factory=list)  # ((x1, y1), (x2, y2)) in pixels
 
     @property
     def name(self):
@@ -709,10 +787,11 @@ def read_region(label_path, size):
     return boxes[0] if boxes else None
 
 
-def load_target(path, label_path):
+def load_target(path, label_path, lines_path=None):
     with Image.open(path) as opened:
         image = opened.convert("RGB")
-    return Target(path, image, read_region(label_path, image.size))
+    lines = read_out_lines(lines_path, image.size) if lines_path is not None else []
+    return Target(path, image, read_region(label_path, image.size), lines)
 
 
 def code_mode_problem(code, mode):
@@ -749,9 +828,20 @@ def task_rng(seed, code_name, background_name, mode, variant):
 class Generator:
     """Composes synthetic images for any code × target pair."""
 
-    def __init__(self, size_mode="image", region_fill=REGION_FILL):
+    def __init__(self, size_mode="image", region_fill=REGION_FILL,
+                 angle_jitter_deg=JITTER_ANGLE_DEG):
         self.size_mode = size_mode
         self.region_fill = region_fill
+        self.angle_jitter_deg = angle_jitter_deg
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(settings.size_mode, angle_jitter_deg=settings.angle_jitter_deg)
+
+    @property
+    def angle_jitter(self):
+        """Largest random rotation of the date, in radians."""
+        return angle_jitter_radians(self.angle_jitter_deg)
 
     # ---------------------------------------------------------------- sizing
 
@@ -1034,6 +1124,8 @@ class Generator:
         if mode == "arc" and target.region is not None and \
                 self.auto_arc_range(code, target) is None:
             return "vùng đặt quá thấp để uốn cong date"
+        if mode == "out_line" and not target.out_lines:
+            return "background chưa có đường out-line"
         return None
 
     @staticmethod
@@ -1086,7 +1178,44 @@ class Generator:
         elif effect == "cut":
             state["cut_lines"] = self.automatic_cut_lines(code, mode, rng)
             state["cut_side"] = "above" if variant % 2 == 0 else "below"
+        elif mode == "out_line":
+            # Where the date sits on the line, as fractions; see out_line_region.
+            state["out_line"] = {"line": rng.randrange(len(target.out_lines)),
+                                 "t": rng.random(), "across": rng.random(),
+                                 "along": rng.random()}
         return state
+
+    def out_line_region(self, code, target, state, base):
+        """Placement region for an "out_line" state.
+
+        Takes the point at fraction ``t`` of the chosen line and moves the date
+        (normal layout, angle of ``base``) so that this point lies inside the
+        date's outline: ``across`` sets how deep the line cuts into the date,
+        ``along`` where along it. The caller still checks that a character
+        really touches the line and that the date stays inside the image.
+        """
+        params = state["out_line"]
+        (x1, y1), (x2, y2) = target.out_lines[params["line"] % len(target.out_lines)]
+        point_x, point_y = x1 + (x2 - x1) * params["t"], y1 + (y2 - y1) * params["t"]
+        length = math.hypot(x2 - x1, y2 - y1)
+        ux, uy = ((x2 - x1) / length, (y2 - y1) / length) if length > 1e-9 else (1.0, 0.0)
+        nx, ny = -uy, ux
+        probe = Box(base.cls, 0.0, 0.0, base.w, base.h, base.angle)
+        placed = layout_boxes(code.boxes, probe, "normal", 3, 0.0, self.scale(code, target))
+        corners = [corner for box in placed for corner in box.corners()]
+        across = [x * nx + y * ny for x, y in corners]
+        along = [x * ux + y * uy for x, y in corners]
+        s = min(across) + (max(across) - min(across)) * params["across"]
+        k = min(along) + (max(along) - min(along)) * params["along"]
+        center = [point_x - nx * s - ux * k, point_y - ny * s - uy * k]
+        # Slide the date back into the image. A line near the image edge then
+        # still cuts the date's edge instead of the attempt being wasted.
+        for axis, limit in enumerate(target.image.size):
+            low = -min(corner[axis] for corner in corners) + .5
+            high = limit - max(corner[axis] for corner in corners) - .5
+            if low <= high:
+                center[axis] = max(low, min(high, center[axis]))
+        return Box(base.cls, center[0], center[1], base.w, base.h, base.angle)
 
     def jobs(self, code, target, saved_modes, selected=None):
         """Return ``(jobs, skipped)`` for one pair.
@@ -1118,29 +1247,57 @@ class Generator:
 
     # ------------------------------------------------------------ generating
 
-    @staticmethod
-    def jittered_region(region, rng):
+    def jittered_region(self, region, rng):
         jittered = copy.deepcopy(region)
         jittered.cx += rng.uniform(-JITTER_SHIFT, JITTER_SHIFT) * region.w
         jittered.cy += rng.uniform(-JITTER_SHIFT, JITTER_SHIFT) * region.h
-        jittered.angle += rng.uniform(-JITTER_ANGLE, JITTER_ANGLE)
+        # Always draw the angle, even at 0°, so the other draws stay the same.
+        limit = self.angle_jitter
+        jittered.angle += rng.uniform(-limit, limit)
         return jittered
 
     def generate(self, code, target, job, variant, rng, fingerprints):
-        """Compose one new image for ``job`` that fits the region."""
+        """Compose one new image for ``job``.
+
+        Every mode except "out_line" must fit the region and must not touch an
+        out-line, since that would also be an "out" error. "out_line" must touch
+        a line with at least one character and stay inside the image.
+        """
+        out_mode, touched = False, 0
         for _attempt in range(MAX_ATTEMPTS):
+            # The jitter is drawn before the state, as before out-lines existed,
+            # so the other modes still make the same images for the same seed.
             region = self.jittered_region(target.region, rng)
-            result = self.compose(code, target, job.make_state(variant, rng), region)
+            state = job.make_state(variant, rng)
+            out_mode = state["mode"] == "out_line"
+            if out_mode:
+                region = self.out_line_region(code, target, state, region)
+            result = self.compose(code, target, state, region)
             if result.blank:
                 raise ValueError(f"box {result.blank} không có nét in")
-            if not result.boxes or not all(
-                    box_inside_box(box, target.region) for box in result.boxes):
+            if not result.boxes:
+                continue
+            result.out_hits = out_line_hits(result.boxes, target.out_lines)
+            if out_mode:
+                if not result.out_hits or not all(
+                        box.valid(*target.image.size) for box in result.boxes):
+                    continue
+            elif not all(box_inside_box(box, target.region) for box in result.boxes):
+                continue
+            elif result.out_hits:
+                touched += 1
                 continue
             fingerprint = hashlib.sha256(result.image.tobytes()).digest()
             if fingerprint in fingerprints:
                 continue
             fingerprints.add(fingerprint)
             return result
+        if out_mode:
+            raise ValueError(f"sau {MAX_ATTEMPTS} lần thử không đặt được date chạm đường "
+                             "out-line mà vẫn nằm trọn trong ảnh; hãy kẻ đường xa mép ảnh hơn")
+        if touched > MAX_ATTEMPTS // 2:
+            raise ValueError(f"sau {MAX_ATTEMPTS} lần thử date vẫn chạm đường out-line; "
+                             "hãy dời vùng đặt ra xa đường out-line")
         raise ValueError(f"sau {MAX_ATTEMPTS} lần thử không tạo được ảnh mới nằm trọn "
                          "trong vùng đặt; hãy nới rộng vùng đặt hoặc giảm số lượng")
 
@@ -1159,6 +1316,7 @@ class BatchSettings:
     modes_off: list | None = None
     val_percent: int = 20
     size_mode: str = "image"             # "image" | "region"
+    angle_jitter_deg: float = JITTER_ANGLE_DEG  # date rotated by up to ± this
 
     @classmethod
     def from_config(cls, data):
@@ -1178,6 +1336,12 @@ class BatchSettings:
                 setattr(settings, name, max(low, min(high, int(data[name]))))
             except (KeyError, TypeError, ValueError):
                 pass
+        try:
+            angle = float(data["angle_jitter_deg"])
+            if math.isfinite(angle):
+                settings.angle_jitter_deg = max(0.0, min(MAX_JITTER_ANGLE_DEG, angle))
+        except (KeyError, TypeError, ValueError):
+            pass
         if isinstance(data.get("modes"), list):
             settings.modes = [str(name) for name in data["modes"]]
         if isinstance(data.get("modes_unchecked"), list):
@@ -1296,7 +1460,7 @@ def plan_batch(codes, targets, saved_modes, settings, seed, generator=None,
     ``previous_split`` is ``(split_by, {name: split})`` read from an earlier
     run's manifest in the same output folder.
     """
-    generator = generator or Generator(settings.size_mode)
+    generator = generator or Generator.from_settings(settings)
     modes = settings.selected_modes(all_mode_names(saved_modes))
     plan = BatchPlan(seed, settings, modes, [])
     if not codes:
@@ -1305,6 +1469,12 @@ def plan_batch(codes, targets, saved_modes, settings, seed, generator=None,
         plan.warnings.append("Chưa chọn background nào.")
     if not modes:
         plan.warnings.append("Chưa chọn dạng lỗi nào.")
+
+    for target in sorted(targets, key=lambda item: item.name.casefold()):
+        if target.region is not None and out_line_hits([target.region], target.out_lines):
+            plan.warnings.append(
+                f"Vùng đặt của {target.name} cắt đường out-line: các dạng lỗi khác chỉ "
+                "đặt date ở phần vùng không chạm đường, có thể không tạo được ảnh.")
 
     code_problems = {}
     for code in codes:
@@ -1485,6 +1655,32 @@ def write_dataset_metadata(out, split):
         atomic_write(yaml_path, text)
 
 
+def write_out_lines_index(out, plan):
+    """Record each background's out-lines in ``out/out_lines.json``.
+
+    Generated images keep their background's pixel frame, so an automatic
+    "out" check can apply ``out_line_hits`` with these lines to the detected
+    boxes of any image whose manifest row names that background. Entries of
+    earlier runs are kept.
+    """
+    targets = {pair.target.name: pair.target for pair, _mode, _count in plan.tasks()
+               if pair.target.out_lines}
+    if not targets:
+        return
+    path = out / "out_lines.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    for name, target in sorted(targets.items()):
+        data[name] = {"size": list(target.image.size),
+                      "lines": [[[round(x, 2), round(y, 2)] for x, y in line]
+                                for line in target.out_lines]}
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
 def _fingerprint_file(path):
     with Image.open(path) as opened:
         return hashlib.sha256(opened.convert("RGB").tobytes()).digest()
@@ -1498,7 +1694,7 @@ def run_batch(plan, out, generator=None, progress=None):
     same seed are skipped, so a cancelled run can be resumed.
     """
     out = Path(out)
-    generator = generator or Generator(plan.settings.size_mode)
+    generator = generator or Generator.from_settings(plan.settings)
     split_layout = plan.settings.val_percent > 0
     result = BatchResult(out, plan.seed)
     rows = read_manifest(out)
@@ -1586,6 +1782,7 @@ def run_batch(plan, out, generator=None, progress=None):
                 done += count - made
             result.made[mode] = result.made.get(mode, 0) + made
         write_dataset_metadata(out, split_layout)
+        write_out_lines_index(out, plan)
         append_export_log(out, plan, result)
     except OSError as exc:
         result.error = str(exc)
@@ -1602,6 +1799,7 @@ def append_export_log(out, plan, result):
         f"count={plan.settings.count}", f"count_mode={plan.settings.count_mode}",
         f"val={plan.settings.val_percent}%", f"split_by={plan.split_by or '-'}",
         f"size={plan.settings.size_mode}",
+        f"angle=±{plan.settings.angle_jitter_deg:g}°",
         "pairs=" + ";".join(f"{code}+{background}" for code, background in pairs),
         ",".join(f"{name}={made}" for name, made in result.made.items()),
         f"resumed={result.resumed}" + (" cancelled" if result.cancelled else ""),
@@ -1626,7 +1824,7 @@ def contact_sheet(plan, generator=None, max_pairs=4, cell=(360, 150)):
     images are exactly what the run makes as variant 0 of each pair and mode.
     Returns ``(image, failures)``.
     """
-    generator = generator or Generator(plan.settings.size_mode)
+    generator = generator or Generator.from_settings(plan.settings)
     pairs = [pair for pair in plan.valid_pairs if pair.jobs]
     # Prefer different codes first, then different backgrounds.
     chosen, seen_codes = [], set()
@@ -1653,13 +1851,6 @@ def contact_sheet(plan, generator=None, max_pairs=4, cell=(360, 150)):
         draw.text((6, top + 6), pair.code.stem[:26], fill=(0, 229, 255), font=small)
         draw.text((6, top + 24), "× " + pair.target.stem[:24], fill=(255, 202, 40), font=small)
         region = pair.target.region
-        corners = region.corners()
-        left, right = min(x for x, _ in corners), max(x for x, _ in corners)
-        upper, lower = min(y for _, y in corners), max(y for _, y in corners)
-        margin_x, margin_y = (right - left) * .15, (lower - upper) * .35
-        box = (max(0, left - margin_x), max(0, upper - margin_y),
-               min(pair.target.image.width, right + margin_x),
-               min(pair.target.image.height, lower + margin_y))
         for column, mode in enumerate(modes):
             x0 = label_width + column * cell_w
             if mode not in pair.jobs:
@@ -1674,11 +1865,26 @@ def contact_sheet(plan, generator=None, max_pairs=4, cell=(360, 150)):
                 failures.append(f"{pair.code.stem} × {pair.target.stem} · {mode}: {exc}")
                 draw.text((x0 + 6, top + cell_h // 2 - 8), "lỗi", fill=(255, 82, 82), font=font)
                 continue
-            crop = composition.image.crop(tuple(round(value) for value in box))
+            # Crop around the region and the date: an out-line date may sit
+            # outside the region.
+            corners = region.corners() + [corner for label in composition.boxes
+                                          for corner in label.corners()]
+            left, right = min(x for x, _ in corners), max(x for x, _ in corners)
+            upper, lower = min(y for _, y in corners), max(y for _, y in corners)
+            margin_x, margin_y = (right - left) * .15, (lower - upper) * .35
+            box = tuple(round(value) for value in (
+                max(0, left - margin_x), max(0, upper - margin_y),
+                min(pair.target.image.width, right + margin_x),
+                min(pair.target.image.height, lower + margin_y)))
+            crop = composition.image.crop(box)
             overlay = ImageDraw.Draw(crop)
-            for label in composition.boxes:
-                overlay.polygon([(x - round(box[0]), y - round(box[1]))
-                                 for x, y in label.corners()], outline=(0, 230, 0))
+            for line in pair.target.out_lines:
+                overlay.line([(x - box[0], y - box[1]) for x, y in line],
+                             fill=(255, 64, 255), width=3)
+            hits = set(composition.out_hits)
+            for index, label in enumerate(composition.boxes):
+                overlay.polygon([(x - box[0], y - box[1]) for x, y in label.corners()],
+                                outline=(255, 64, 64) if index in hits else (0, 230, 0))
             factor = min((cell_w - 8) / crop.width, (cell_h - 8) / crop.height)
             thumb = crop.resize((max(1, round(crop.width * factor)),
                                  max(1, round(crop.height * factor))),

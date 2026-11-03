@@ -18,13 +18,14 @@ from PIL import Image, ImageDraw, ImageTk
 from label_obb import Box, atomic_write, decode, encode, normalize_angle
 from synth_engine import (  # noqa: F401  (re-exported for scripts and tests)
     AUTO_ERROR_MODES, CONFIRM_ABOVE, CUT_SIDES, EFFECT_MODES, IMAGE_EXTENSIONS,
-    JITTER_ANGLE, JITTER_SHIFT, MAX_ATTEMPTS, STATE_VERSION, BatchSettings, Code,
+    JITTER_ANGLE, JITTER_ANGLE_DEG, JITTER_SHIFT, MAX_ATTEMPTS, MAX_JITTER_ANGLE_DEG, STATE_VERSION, BatchSettings, Code,
     Composition, Generator, Job, Target, all_mode_names, auto_job_name, box_inside_box,
     character_asset, clip_box_to_side, code_mode_problem, contact_sheet, default_state,
-    erase_boxes, first_free_number, image_files, image_to_local, layout_conflict,
-    layout_boxes, line_crosses_box, line_side_mask, load_code, load_target, local_to_image,
-    normalize_state, oriented_line, overlapping_boxes, plan_batch, previous_split,
-    propose_character_boxes, read_manifest, read_region, run_batch, scale_region,
+    encode_out_lines, erase_boxes, first_free_number, image_files, image_to_local,
+    layout_conflict, layout_boxes, line_crosses_box, line_side_mask, load_code, load_target,
+    local_to_image, normalize_state, oriented_line, out_line_hits, overlapping_boxes,
+    plan_batch, previous_split, propose_character_boxes, read_manifest, read_out_lines,
+    read_region, run_batch, scale_region,
     split_rows, state_to_json, state_uses_indices, task_rng, text_angle,
 )
 
@@ -44,6 +45,11 @@ def sample_label_path(path):
 
 def region_path(path):
     return BACKGROUND_ROOT / "labels" / f"{path.stem}.txt"
+
+
+def out_line_path(path):
+    """Out-lines of a background (see synth_engine.read_out_lines)."""
+    return BACKGROUND_ROOT / "lines" / f"{path.stem}.json"
 
 
 def read_int(variable, default, low, high):
@@ -135,6 +141,7 @@ class SyntheticLabelTool:
         self.sample_image = self.background_image = None
         self.sample_boxes = []
         self.region = None
+        self.out_lines = []  # background pixels; touching one = "out" error
         self.selected_box = None
         self.history = []
         self.cut_lines = []  # date-local coordinates, see local_to_image
@@ -216,6 +223,7 @@ class SyntheticLabelTool:
             "modes_unchecked": settings.modes_off or [],
             "val_percent": settings.val_percent,
             "size_mode": "region" if self.size_by_region.get() else "image",
+            "angle_jitter_deg": settings.angle_jitter_deg,
         }
 
     def save_config(self):
@@ -281,6 +289,10 @@ class SyntheticLabelTool:
             raise ValueError("batch phải là object")
         self.batch = BatchSettings.from_config(data)
         self.size_by_region.set(self.batch.size_mode == "region")
+        # The generator drives the editor's test images and every plan, so it
+        # must start from the saved settings too.
+        self.generator.size_mode = self.batch.size_mode
+        self.generator.angle_jitter_deg = self.batch.angle_jitter_deg
         if "count" in data:
             self.export_count.set(self.batch.count)
 
@@ -371,13 +383,18 @@ class SyntheticLabelTool:
         ttk.Button(background_buttons2, text="Bỏ hết",
                    command=lambda: self.check_all("background", False)).pack(
                        side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(background_buttons2, text="Xóa đường out-line",
+                   command=self.clear_out_lines).pack(side="left", fill="x", expand=True,
+                                                      padx=(4, 0))
 
         ttk.Separator(side).pack(fill="x", pady=8)
         ttk.Label(side, text="Vẽ / thao tác chuột").pack(anchor="w")
         for text, value in (("Vẽ/sửa box (ảnh mẫu) hoặc vùng (background)", "edit"),
                             ("Kéo ngang chỉnh spacing/overlap", "adjust_horizontal"),
                             ("Kéo dọc chỉnh cong", "adjust_arc"),
-                            ("Kẻ đường cắt", "cut_line")):
+                            ("Kẻ đường cắt", "cut_line"),
+                            ("Kẻ đường out-line trên background (date chạm = lỗi out)",
+                             "out_line")):
             ttk.Radiobutton(side, text=text, variable=self.draw_mode, value=value,
                             command=self._sync_view).pack(anchor="w")
 
@@ -649,11 +666,30 @@ class SyntheticLabelTool:
         self._status_cache[("region", path)] = (stamp, region)
         return region
 
+    def background_out_lines(self, path):
+        """The out-lines saved for a background ([] if none), cached by mtime."""
+        if path == self.background_path and self.background_image is not None:
+            return self.out_lines
+        lines_file = out_line_path(path)
+        stamp = self._stamp(path, lines_file)
+        cached = self._status_cache.get(("lines", path))
+        if cached and cached[0] == stamp:
+            return cached[1]
+        size = self.image_size(path)
+        try:
+            lines = read_out_lines(lines_file, size) if size else []
+        except (OSError, ValueError, TypeError, UnicodeError):
+            lines = []
+        self._status_cache[("lines", path)] = (stamp, lines)
+        return lines
+
     def background_info(self, path):
         region = self.background_region(path)
+        lines = self.background_out_lines(path)
+        suffix = f" · {len(lines)} out-line" if lines else ""
         if region is None:
-            return {"text": "✗ chưa có vùng", "level": "warn"}
-        return {"text": f"✓ vùng {region.w:.0f}×{region.h:.0f}", "level": ""}
+            return {"text": "✗ chưa có vùng" + suffix, "level": "warn"}
+        return {"text": f"✓ vùng {region.w:.0f}×{region.h:.0f}" + suffix, "level": ""}
 
     def code_checked(self, path):
         if path.name in self.code_checks:
@@ -778,6 +814,7 @@ class SyntheticLabelTool:
     def clear_background(self):
         self.background_index, self.background_path = -1, None
         self.background_image = self.region = None
+        self.out_lines = []
         self.selected_box = None
         self.history.clear()
 
@@ -873,12 +910,14 @@ class SyntheticLabelTool:
             if len(saved_boxes) > 1:
                 raise ValueError("Nhãn background chỉ được chứa một OBB vùng đặt date.")
             region = saved_boxes[0] if saved_boxes else None
+            out_lines = read_out_lines(out_line_path(path), image.size)
         except (OSError, ValueError, TypeError) as exc:
             messagebox.showerror("Không mở được background", f"{path.name}: {exc}")
             self._select(self.background_list, self.background_index)
             return False
         self.background_index, self.background_path = index, path
         self.background_image, self.region = image, region
+        self.out_lines = out_lines
         self.selected_box = None
         self.history.clear()
         self._select(self.background_list, index)
@@ -989,6 +1028,21 @@ class SyntheticLabelTool:
         if self.batch_dialog is not None:
             self.batch_dialog.schedule_refresh()
 
+    def autosave_out_lines(self):
+        if self.background_image is None or self.background_path is None:
+            return
+        path = out_line_path(self.background_path)
+        try:
+            if self.out_lines:
+                atomic_write(path, encode_out_lines(self.out_lines, self.background_image.size))
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            messagebox.showerror("Không tự động lưu được đường out-line", str(exc))
+        self.update_background_row(self.background_index)
+        if self.batch_dialog is not None:
+            self.batch_dialog.schedule_refresh()
+
     def create_background_from_boxes(self):
         """Remove the boxed characters of every checked code and save each
         result as a new background ``<code>_background_NNNNNN.png``."""
@@ -1042,7 +1096,7 @@ class SyntheticLabelTool:
     # ------------------------------------------------------------- edit state
 
     def _sync_view(self):
-        target = {"cut_line": "preview", "adjust_horizontal": "preview",
+        target = {"cut_line": "preview", "out_line": "preview", "adjust_horizontal": "preview",
                   "adjust_arc": "preview"}.get(self.draw_mode.get())
         # "edit" draws/edits in whichever view is shown, like the toolbar button.
         if target:
@@ -1227,6 +1281,7 @@ class SyntheticLabelTool:
             "sample_boxes": copy.deepcopy(self.sample_boxes),
             "region": copy.deepcopy(self.region),
             "cut_lines": copy.deepcopy(self.cut_lines),
+            "out_lines": copy.deepcopy(self.out_lines),
             "deleted_indices": set(self.deleted_indices),
             "spacing_groups": copy.deepcopy(self.spacing_groups),
         }
@@ -1246,9 +1301,11 @@ class SyntheticLabelTool:
         entry = self.history.pop()
         sample_changed = entry["sample_boxes"] != self.sample_boxes
         region_changed = entry["region"] != self.region
+        lines_changed = entry["out_lines"] != self.out_lines
         self.sample_boxes = entry["sample_boxes"]
         self.region = entry["region"]
         self.cut_lines = entry["cut_lines"]
+        self.out_lines = entry["out_lines"]
         self.deleted_indices = entry["deleted_indices"]
         self.spacing_groups = entry["spacing_groups"]
         self.refresh_spacing_groups()
@@ -1257,6 +1314,8 @@ class SyntheticLabelTool:
             self.autosave_sample_boxes()
         if region_changed:
             self.autosave_region()
+        if lines_changed:
+            self.autosave_out_lines()
         self.show_preview()
         self.status.set("Đã hoàn tác thao tác gần nhất")
 
@@ -1302,7 +1361,7 @@ class SyntheticLabelTool:
         return Code(self.sample_path, self.sample_image, self.sample_boxes, self._asset_cache)
 
     def current_target(self):
-        return Target(self.background_path, self.background_image, self.region)
+        return Target(self.background_path, self.background_image, self.region, self.out_lines)
 
     def on_size_mode_change(self):
         self.generator.size_mode = "region" if self.size_by_region.get() else "image"
@@ -1353,6 +1412,10 @@ class SyntheticLabelTool:
         return self.region is None or all(
             box_inside_box(box, self.region) for box in self.preview_boxes)
 
+    def preview_out_hits(self):
+        """Preview boxes touching an out-line (the date would be "out")."""
+        return out_line_hits(self.preview_boxes, self.out_lines)
+
     def update_info(self):
         parts = [f"Mẫu: {len(self.sample_boxes)} box",
                  "Background: " + ("đã có vùng đặt" if self.region else "chưa có vùng đặt"),
@@ -1363,6 +1426,10 @@ class SyntheticLabelTool:
             parts.append(f"CẢNH BÁO: box {self.preview_blank} không tách được nét in")
         if self.region and self.preview_boxes and not self.preview_fits():
             parts.append("CẢNH BÁO: date vượt vùng chứa")
+        if self.out_lines:
+            parts.append(f"{len(self.out_lines)} đường out-line")
+            if self.preview_out_hits():
+                parts.append("CẢNH BÁO: date chạm đường out-line (= lỗi out)")
         self.info.set(" | ".join(parts))
 
     # ---------------------------------------------------------------- canvas
@@ -1427,8 +1494,17 @@ class SyntheticLabelTool:
                 self.canvas.create_text(*points[0], text=str(index), anchor="sw", fill="white")
                 if self.selected_box == index:
                     self.draw_edit_handles(box, self.COLORS[index % len(self.COLORS)])
-        elif self.region:
-            region_color = "#00e5ff" if self.preview_fits() else "#ff5252"
+            return
+        for line in self.out_lines:
+            start, end = (self.screen(*point) for point in line)
+            self.canvas.create_line(*start, *end, fill="#ff40ff", width=3)
+        for index in self.preview_out_hits():
+            points = [self.screen(x, y) for x, y in self.preview_boxes[index].corners()]
+            self.canvas.create_polygon(*[value for point in points for value in point],
+                                       fill="", outline="#ff5252", width=2)
+        if self.region:
+            region_color = ("#00e5ff" if self.preview_fits() and not self.preview_out_hits()
+                            else "#ff5252")
             points = [self.screen(x, y) for x, y in self.region.corners()]
             self.canvas.create_polygon(*[value for point in points for value in point],
                                        fill="", outline=region_color, width=2, dash=(6, 4))
@@ -1485,7 +1561,7 @@ class SyntheticLabelTool:
                                 else "target_region", "start": point}
             self.render()
             return
-        needed = {"cut_line": "preview"}.get(kind)
+        needed = {"cut_line": "preview", "out_line": "preview"}.get(kind)
         if needed and self.view.get() != needed:
             self.status.set(
                 "Thao tác này dùng trên " + ("ảnh mẫu: bấm 'Xem ảnh mẫu'" if needed == "sample"
@@ -1555,9 +1631,10 @@ class SyntheticLabelTool:
             self.show_preview()
         else:
             self.canvas.delete("gesture_preview")
-            if kind == "cut_line":
+            if kind in ("cut_line", "out_line"):
                 self.canvas.create_line(*self.screen(*start), *self.screen(*point),
-                                        fill="white", width=2, dash=(5, 3), tags="gesture_preview")
+                                        fill="white" if kind == "cut_line" else "#ff40ff",
+                                        width=2, dash=(5, 3), tags="gesture_preview")
             else:
                 self.canvas.create_rectangle(*self.screen(*start), *self.screen(*point),
                                              outline="white", dash=(5, 3), tags="gesture_preview")
@@ -1601,6 +1678,8 @@ class SyntheticLabelTool:
                     return
         elif kind == "cut_line" and self.view.get() == "preview":
             self.add_cut_line(start, point)
+        elif kind == "out_line" and self.view.get() == "preview":
+            self.add_out_line(start, point)
         elif kind.startswith("edit_") and gesture["changed"]:
             if self.view.get() == "sample":
                 self.autosave_sample_boxes()
@@ -1624,6 +1703,32 @@ class SyntheticLabelTool:
             self.cut_side.set("above")
         self.set_mode("cut", refresh=False)
         self.status.set(f"Đã kẻ {len(self.cut_lines)} đường cắt; chọn phía cần xóa")
+
+    def add_out_line(self, start, end):
+        """Add an out-line to the open background (saved at once)."""
+        if self.background_image is None or self.background_path is None:
+            self.status.set("Hãy chọn background trước khi kẻ đường out-line")
+            return
+        if math.dist(start, end) * self.scale < 4:
+            self.status.set("Đường out-line quá ngắn: hãy giữ chuột và kéo để kẻ")
+            return
+        width, height = self.background_image.size
+        line = tuple((max(0.0, min(width, x)), max(0.0, min(height, y))) for x, y in (start, end))
+        self.snapshot()
+        self.out_lines.append(line)
+        self.autosave_out_lines()
+        self.status.set(f"Background có {len(self.out_lines)} đường out-line: date chạm "
+                        "đường = lỗi out (dạng auto out_line); Ctrl+Z để hoàn tác")
+
+    def clear_out_lines(self):
+        if not self.out_lines:
+            self.status.set("Background đang mở chưa có đường out-line")
+            return
+        self.snapshot()
+        self.out_lines = []
+        self.autosave_out_lines()
+        self.show_preview()
+        self.status.set("Đã xóa các đường out-line của background này; Ctrl+Z để hoàn tác")
 
     def clear_cut_lines(self):
         if not self.cut_lines:
@@ -2018,13 +2123,18 @@ class SyntheticLabelTool:
             region = scale_region(self.region, source_size, size)
             try:
                 atomic_write(region_path(path), encode([region], *size))
+                if self.out_lines:
+                    # Stored relative to the image size, so the same text fits.
+                    atomic_write(out_line_path(path),
+                                 encode_out_lines(self.out_lines, source_size))
             except (OSError, ValueError) as exc:
                 failures.append(f"{path.name}: {exc}")
                 continue
             copied += 1
         self.update_rows()
-        self.status.set(f"Đã áp vùng cho {copied} background")
-        message = f"Đã áp vùng cho {copied} background."
+        what = "vùng và đường out-line" if self.out_lines else "vùng"
+        self.status.set(f"Đã áp {what} cho {copied} background")
+        message = f"Đã áp {what} cho {copied} background."
         if failures:
             message += "\n\nLỗi:\n" + "\n".join(failures)
         (messagebox.showwarning if failures else messagebox.showinfo)("Áp vùng", message)
@@ -2065,6 +2175,9 @@ class SyntheticLabelTool:
                     ImageDraw.Draw(thumb).polygon(
                         [(x * factor, y * factor) for x, y in region.corners()],
                         outline=(0, 229, 255), width=2)
+                for line in self.background_out_lines(path):
+                    ImageDraw.Draw(thumb).line(
+                        [(x * factor, y * factor) for x, y in line], fill=(255, 64, 255), width=2)
                 photo = ImageTk.PhotoImage(thumb)
                 window.photos.append(photo)
                 tag = f"item{index}"
@@ -2125,14 +2238,14 @@ class SyntheticLabelTool:
             if path == self.background_path and self.background_image is not None:
                 targets.append(self.current_target())
                 continue
-            label = region_path(path)
-            stamp = self._stamp(path, label)
+            label, lines = region_path(path), out_line_path(path)
+            stamp = self._stamp(path, label, lines)
             cached = cache.get(("target", path))
             if cached and cached[0] == stamp:
                 targets.append(cached[1])
                 continue
             try:
-                target = load_target(path, label)
+                target = load_target(path, label, lines)
             except (OSError, ValueError) as exc:
                 errors.append(f"{path.name}: {exc}")
                 continue
@@ -2250,6 +2363,20 @@ class BatchDialog:
                         command=app.on_size_mode_change).grid(row=row, column=1, sticky="w")
         row += 1
 
+        self.angle = tk.StringVar(value=f"{settings.angle_jitter_deg:g}")
+        label("Góc xoay:")
+        angle = ttk.Frame(frame)
+        angle.grid(row=row, column=1, sticky="w")
+        ttk.Label(angle, text="ngẫu nhiên ±").pack(side="left")
+        angle_spin = ttk.Spinbox(angle, from_=0, to=MAX_JITTER_ANGLE_DEG, increment=.5,
+                                 textvariable=self.angle, width=6)
+        angle_spin.pack(side="left", padx=4)
+        angle_spin.bind("<FocusOut>", lambda _event: self.angle.set(
+            f"{read_float(self.angle, settings.angle_jitter_deg, 0, MAX_JITTER_ANGLE_DEG):g}"))
+        ttk.Label(angle, text=f"° quanh góc vùng đặt (mặc định {JITTER_ANGLE_DEG:g}°; góc lớn "
+                              "cần vùng đặt rộng hơn)").pack(side="left")
+        row += 1
+
         label("Seed:")
         seed = ttk.Frame(frame)
         seed.grid(row=row, column=1, sticky="w")
@@ -2278,7 +2405,7 @@ class BatchDialog:
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=3)
 
         for variable in (self.pairing, self.limit_on, self.limit, self.count_mode, self.val,
-                         app.export_count, *self.mode_vars.values()):
+                         self.angle, app.export_count, *self.mode_vars.values()):
             variable.trace_add("write", lambda *_args: self.schedule_refresh())
         self.refresh()
 
@@ -2296,6 +2423,9 @@ class BatchDialog:
                               if not variable.get()]
         settings.modes = None
         settings.size_mode = self.app.generator.size_mode
+        settings.angle_jitter_deg = read_float(self.angle, settings.angle_jitter_deg,
+                                               0.0, MAX_JITTER_ANGLE_DEG)
+        self.app.generator.angle_jitter_deg = settings.angle_jitter_deg
         return settings
 
     def schedule_refresh(self):
@@ -2553,6 +2683,8 @@ def run_batch_cli(argv=None):
     parser.add_argument("--out", help="thư mục xuất (mặc định: theo cấu hình)")
     parser.add_argument("--seed", type=int, help="seed (mặc định: theo cấu hình, trống = ngẫu nhiên)")
     parser.add_argument("--count", type=int, help="số ảnh (mặc định: theo cấu hình)")
+    parser.add_argument("--angle", type=float,
+                        help="góc xoay ngẫu nhiên ± độ (mặc định: theo cấu hình)")
     parser.add_argument("--check", action="store_true", help="chỉ in bảng kiểm tra, không tạo ảnh")
     args = parser.parse_args(argv)
     config_path = Path(args.config)
@@ -2561,6 +2693,8 @@ def run_batch_cli(argv=None):
     settings = BatchSettings.from_config(batch)
     if args.count:
         settings.count = max(1, args.count)
+    if args.angle is not None and math.isfinite(args.angle):
+        settings.angle_jitter_deg = max(0.0, min(MAX_JITTER_ANGLE_DEG, args.angle))
     saved_modes = []
     for item in data.get("saved_modes", []) or []:
         try:
@@ -2586,7 +2720,7 @@ def run_batch_cli(argv=None):
         if path.name in backgrounds_off:
             continue
         try:
-            targets.append(load_target(path, region_path(path)))
+            targets.append(load_target(path, region_path(path), out_line_path(path)))
         except (OSError, ValueError) as exc:
             print(f"bỏ qua background {path.name}: {exc}", file=sys.stderr)
     seed = args.seed
@@ -2594,10 +2728,10 @@ def run_batch_cli(argv=None):
         text = str(data.get("seed", "")).strip()
         seed = int(text) if text.lstrip("-").isdigit() else random.SystemRandom().randrange(2 ** 31)
     out = Path(args.out or data.get("synthetic_output_dir") or OUTPUT_ROOT).resolve()
-    generator = Generator(settings.size_mode)
+    generator = Generator.from_settings(settings)
     plan = plan_batch(codes, targets, saved_modes, settings, seed, generator,
                       previous_split(read_manifest(out)))
-    print(f"seed={seed}  out={out}")
+    print(f"seed={seed}  out={out}  angle=±{settings.angle_jitter_deg:g}°")
     for pair in plan.pairs:
         name = f"{pair.code.stem} × {pair.target.stem}"
         if pair.problem:
