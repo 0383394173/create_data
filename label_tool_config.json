@@ -1,11 +1,47 @@
 {
   "synthetic_output_dir": "D:\\data_cognex\\synthetic_output",
-  "export_count": 10,
+  "export_count": 30,
+  "seed": "",
   "stack_size": 2,
   "arc_height": 35.0,
   "blur_radius": 2.0,
   "group_indices_text": "0-2",
   "delete_scope": "box",
   "saved_mode_serial": 0,
-  "saved_modes": []
+  "saved_modes": [],
+  "batch": {
+    "codes": [],
+    "codes_unchecked": [
+      "Image_0054_20261101195100.bmp",
+      "Image_0057_20261101195202.bmp",
+      "Image_0058_20261101195205.bmp",
+      "Image_0059_20261101195208.bmp"
+    ],
+    "backgrounds": [
+      "Image_0053_20261101195055_background_000000.png",
+      "Image_0054_20261101195100_background_000000.png",
+      "Image_0057_20261101195202_background_000000.png",
+      "Image_0058_20261101195205_background_000000.png",
+      "Image_0059_20261101195208_background_000000.png"
+    ],
+    "backgrounds_unchecked": [],
+    "pairing": "all",
+    "max_backgrounds_per_code": 0,
+    "count": 30,
+    "count_mode": "per_mode",
+    "modes": [
+      "auto_spacing",
+      "auto_overlap",
+      "auto_blur",
+      "auto_cut_row_1",
+      "auto_cut_row_2",
+      "auto_cut_both_rows",
+      "auto_delete_objects"
+    ],
+    "modes_unchecked": [
+      "auto_arc"
+    ],
+    "val_percent": 0,
+    "size_mode": "image"
+  }
 }
