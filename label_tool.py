@@ -73,6 +73,167 @@ def read_float(variable, default, low, high):
         return default
     return max(low, min(high, value))
 
+
+# ------------------------------------------------------------- image panes
+
+CANVAS_BG = "#20242b"
+ACTIVE_BORDER = "#4fc3f7"
+BAR_BG = "#2d333b"
+BAR_SELECTED = "#1f6feb"
+BAR_HOVER = "#3d444d"
+BAR_TEXT = "#e6edf3"
+
+
+def make_icon(name, size=20):
+    """Draw a small toolbar icon (antialiased by drawing at 4× and shrinking)."""
+    k = 4
+    image = Image.new("RGBA", (size * k, size * k), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    s = size * k / 80  # icons are designed on an 80×80 grid
+    pen = max(1, round(6 * s))
+
+    def p(*values):
+        return [value * s for value in values]
+
+    light, cyan, yellow = BAR_TEXT, "#00e5ff", "#ffca28"
+    magenta, red, gray = "#ff40ff", "#ff7b72", "#8b949e"
+
+    def handles(color, x0, y0, x1, y1):
+        for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            draw.rectangle(p(x - 7, y - 7, x + 7, y + 7), fill=color)
+
+    def arrow_head(tip, direction, color):
+        x, y = tip
+        dx, dy = direction
+        # Triangle pointing along (dx, dy) with its tip at (x, y).
+        back_x, back_y = x - dx * 16, y - dy * 16
+        side_x, side_y = -dy * 12, dx * 12
+        draw.polygon(p(x, y, back_x + side_x, back_y + side_y,
+                       back_x - side_x, back_y - side_y), fill=color)
+
+    if name == "box":
+        draw.rectangle(p(16, 22, 64, 58), outline=cyan, width=pen)
+        handles(cyan, 16, 22, 64, 58)
+    elif name == "region":
+        for x in range(14, 66, 14):  # dashed rectangle
+            draw.line(p(x, 20, min(x + 8, 66), 20), fill=cyan, width=pen)
+            draw.line(p(x, 60, min(x + 8, 66), 60), fill=cyan, width=pen)
+        for y in range(20, 60, 14):
+            draw.line(p(14, y, 14, min(y + 8, 60)), fill=cyan, width=pen)
+            draw.line(p(66, y, 66, min(y + 8, 60)), fill=cyan, width=pen)
+        handles(cyan, 14, 20, 66, 60)
+    elif name == "spacing":
+        for x in (10, 70):
+            draw.line(p(x, 22, x, 58), fill=gray, width=pen)
+        draw.line(p(24, 40, 56, 40), fill=light, width=pen)
+        arrow_head((20, 40), (-1, 0), light)
+        arrow_head((60, 40), (1, 0), light)
+    elif name == "arc":
+        draw.arc(p(8, 30, 72, 94), start=200, end=340, fill=light, width=pen)
+        draw.line(p(40, 18, 40, 62), fill=gray, width=max(1, pen // 2))
+        arrow_head((40, 12), (0, -1), gray)
+        arrow_head((40, 68), (0, 1), gray)
+    elif name == "cut":
+        draw.rectangle(p(18, 26, 62, 54), outline=gray, width=pen)
+        draw.line(p(6, 66, 74, 14), fill=yellow, width=pen)
+    elif name == "out":
+        draw.rectangle(p(8, 28, 42, 52), outline=gray, width=pen)
+        draw.line(p(56, 8, 56, 72), fill=magenta, width=pen + 2)
+        draw.line(p(42, 40, 52, 40), fill=red, width=pen)
+    elif name == "trash":
+        draw.line(p(16, 20, 64, 20), fill=red, width=pen)
+        draw.line(p(32, 12, 48, 12), fill=red, width=pen)
+        draw.polygon(p(22, 26, 58, 26, 54, 70, 26, 70), outline=red, width=pen)
+        for x in (34, 46):
+            draw.line(p(x, 34, x, 62), fill=red, width=max(1, pen // 2))
+    elif name == "fit":
+        for x, y, dx, dy in ((10, 10, 1, 1), (70, 10, -1, 1), (70, 70, -1, -1), (10, 70, 1, -1)):
+            draw.line(p(x, y, x + dx * 20, y), fill=light, width=pen)
+            draw.line(p(x, y, x, y + dy * 20), fill=light, width=pen)
+        draw.rectangle(p(28, 30, 52, 50), outline=gray, width=max(1, pen // 2))
+    else:
+        raise ValueError(f"unknown icon {name!r}")
+    return ImageTk.PhotoImage(image.resize((size, size), Image.Resampling.LANCZOS))
+
+
+class Tooltip:
+    """Show ``text`` next to ``widget`` after the mouse rests on it."""
+
+    def __init__(self, widget, text, delay=400):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip = self.job = None
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def schedule(self, _event=None):
+        self.hide()
+        self.job = self.widget.after(self.delay, self.show)
+
+    def show(self):
+        self.job = None
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", background="#ffffe0",
+                 foreground="#1f2328", relief="solid", borderwidth=1,
+                 padx=6, pady=2).pack()
+
+    def hide(self, _event=None):
+        if self.job is not None:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
+class ImagePane:
+    """One of the two stacked image views: sample on top, background below.
+
+    Each pane keeps its own zoom/offset, so both images stay visible and
+    zoomable at once; the tool's ``view`` says which one is being edited.
+    """
+
+    TOP = 36  # room for the icon bar above the fitted image
+
+    def __init__(self, view):
+        self.view = view
+        self.canvas = None
+        self.title = None
+        self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
+        self.needs_fit = True
+        self.zoomed = False  # True after a mouse-wheel zoom: keep it on resize
+        self.fitted_size = None
+        self._photo = self._photo_source = self._photo_size = None
+
+    def point(self, x, y):
+        return ((x - self.ox) / self.scale, (y - self.oy) / self.scale)
+
+    def screen(self, x, y):
+        return x * self.scale + self.ox, y * self.scale + self.oy
+
+    def fit(self, image):
+        cw, ch = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        self.scale = max(.001, min((cw - 24) / image.width,
+                                   (ch - self.TOP - 12) / image.height))
+        self.ox = (cw - image.width * self.scale) / 2
+        self.oy = self.TOP + (ch - self.TOP - image.height * self.scale) / 2
+        self.needs_fit = self.zoomed = False
+        self.fitted_size = image.size
+
+    def draw_image(self, image):
+        size = (max(1, round(image.width * self.scale)),
+                max(1, round(image.height * self.scale)))
+        # Re-scaling is the slow part of a redraw; an unchanged image (e.g.
+        # the sample while the background is being edited) reuses its photo.
+        if self._photo_source is not image or self._photo_size != size:
+            self._photo = ImageTk.PhotoImage(image.resize(size, Image.Resampling.BILINEAR))
+            self._photo_source, self._photo_size = image, size
+        self.canvas.create_image(self.ox, self.oy, image=self._photo, anchor="nw")
+
 class ProgressDialog:
     """Modal progress window that keeps Tk responsive during a long export."""
 
@@ -169,8 +330,8 @@ class SyntheticLabelTool:
         self.view = tk.StringVar(value="sample")
         self.draw_mode = tk.StringVar(value="edit")
         self._rotate_key, self._rotate_time = None, 0.0
-        self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
-        self.photo = None
+        self.panes = {"sample": ImagePane("sample"), "preview": ImagePane("preview")}
+        self._icons = {}
         self.gesture = None
         self.busy = False
         self.close_requested = False
@@ -328,7 +489,6 @@ class SyntheticLabelTool:
         top.pack(fill="x")
         for text, command in (("Thêm ảnh mẫu", self.add_samples),
                               ("Thêm background", self.add_backgrounds),
-                              ("Vẽ/sửa box", self.enable_box_edit),
                               ("Undo Ctrl+Z", self.undo),
                               ("Xóa Delete", self.delete_selected),
                               ("Lưu box mẫu", self.save_sample_boxes),
@@ -336,7 +496,6 @@ class SyntheticLabelTool:
                               ("Lưu vùng đặt", self.save_region),
                               ("TỰ ĐỘNG TẠO TẤT CẢ LỖI", self.open_batch_dialog)):
             ttk.Button(top, text=text, command=command).pack(side="left", padx=3)
-        ttk.Button(top, text="Vừa ảnh", command=self.fit).pack(side="left", padx=3)
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.pack(fill="both", expand=True)
@@ -390,17 +549,6 @@ class SyntheticLabelTool:
         ttk.Button(background_buttons2, text="Xóa đường out-line",
                    command=self.clear_out_lines).pack(side="left", fill="x", expand=True,
                                                       padx=(4, 0))
-
-        ttk.Separator(side).pack(fill="x", pady=8)
-        ttk.Label(side, text="Vẽ / thao tác chuột").pack(anchor="w")
-        for text, value in (("Vẽ/sửa box (ảnh mẫu) hoặc vùng (background)", "edit"),
-                            ("Kéo ngang chỉnh spacing/overlap", "adjust_horizontal"),
-                            ("Kéo dọc chỉnh cong", "adjust_arc"),
-                            ("Kẻ đường cắt", "cut_line"),
-                            ("Kẻ đường out-line trên background (date chạm = lỗi out)",
-                             "out_line")):
-            ttk.Radiobutton(side, text=text, variable=self.draw_mode, value=value,
-                            command=self._sync_view).pack(anchor="w")
 
         ttk.Separator(side).pack(fill="x", pady=8)
         ttk.Label(side, text="Dạng lỗi — mỗi lần chỉ chọn một").pack(anchor="w")
@@ -476,8 +624,6 @@ class SyntheticLabelTool:
                             command=self.show_preview).pack(anchor="w")
         ttk.Button(side, text="Xóa các đường cắt",
                    command=self.clear_cut_lines).pack(fill="x", pady=(2, 0))
-        ttk.Button(side, text="Xem ảnh mẫu", command=lambda: self.set_view("sample")).pack(fill="x", pady=(8, 2))
-        ttk.Button(side, text="Xem background/preview", command=lambda: self.set_view("preview")).pack(fill="x")
         output_panel = ttk.LabelFrame(side, text="Thư mục data giả / xem trước", padding=6)
         output_panel.pack(fill="x", pady=(8, 0))
         ttk.Entry(output_panel, textvariable=self.synthetic_output_dir).pack(fill="x")
@@ -505,20 +651,19 @@ class SyntheticLabelTool:
                                                               padx=(4, 0))
         self.on_mode_change()
 
-        self.canvas = tk.Canvas(body, background="#20242b", highlightthickness=0)
-        body.add(self.canvas, weight=1)
+        # Sample on top, background/preview below; the sash moves the split.
+        views = ttk.Panedwindow(body, orient="vertical")
+        body.add(views, weight=1)
+        for view in ("sample", "preview"):
+            views.add(self._build_pane(views, view), weight=1)
+        self._update_pane_borders()
+        self._update_tool_cursor()
         status_bar = ttk.Frame(self.root)
         status_bar.pack(fill="x")
         # Messages and the always-current summary live in separate labels so a
         # redraw never wipes a message (e.g. a config or auto-select notice).
         ttk.Label(status_bar, textvariable=self.status, padding=6).pack(side="left")
         ttk.Label(status_bar, textvariable=self.info, padding=6).pack(side="right")
-        self.canvas.bind("<Configure>", lambda event: self.render())
-        self.canvas.bind("<Button-1>", self.press)
-        self.canvas.bind("<Button-3>", self.delete_sample_box)
-        self.canvas.bind("<B1-Motion>", self.drag)
-        self.canvas.bind("<ButtonRelease-1>", self.release)
-        self.canvas.bind("<MouseWheel>", self.zoom)
         self.root.bind_all("<MouseWheel>", self.side_mousewheel, add="+")
         self.root.bind("<Control-s>", self.on_save_key)
         self.root.bind("<Control-z>", self.on_undo_key)
@@ -529,6 +674,96 @@ class SyntheticLabelTool:
         for key, step in (("<Return>", 1), ("<Right>", 1), ("<Left>", -1)):
             self.root.bind(key, lambda event, step=step: self.on_queue_key(event, step))
         self.root.bind("<Escape>", lambda event: self.on_queue_key(event, 0))
+
+    # Mouse tools of each pane: (draw_mode value, icon, tooltip). The sample
+    # pane only edits boxes; the other tools work on the background/preview.
+    PANE_TOOLS = {
+        "sample": (("edit", "box", "Vẽ/sửa box ký tự\nKéo ở chỗ trống: vẽ box · bấm box: chọn, "
+                    "kéo: di chuyển\nKéo góc: resize · nút tròn hoặc Q/E: xoay · "
+                    "chuột phải: xóa box"),),
+        "preview": (("edit", "region", "Vẽ/sửa vùng đặt date\nKéo ở chỗ trống: vẽ vùng mới · "
+                     "kéo vùng: di chuyển, kéo góc: resize, nút tròn hoặc Q/E: xoay"),
+                    ("adjust_horizontal", "spacing", "Kéo ngang: chỉnh spacing (dạng Dãn cách) "
+                     "hoặc số box chồng (dạng Dồn/chồng)"),
+                    ("adjust_arc", "arc", "Kéo dọc: chỉnh độ cong (dạng Cong lên/xuống)"),
+                    ("cut_line", "cut", "Kẻ đường cắt ngang date (dạng Cắt ngang)"),
+                    ("out_line", "out", "Kẻ đường out-line trên background\n"
+                     "(date chạm đường = lỗi out)")),
+    }
+    TOOL_CURSORS = {"adjust_horizontal": "sb_h_double_arrow",
+                    "adjust_arc": "sb_v_double_arrow",
+                    "cut_line": "tcross", "out_line": "tcross"}
+
+    def _icon(self, name):
+        if name not in self._icons:
+            self._icons[name] = make_icon(name)
+        return self._icons[name]
+
+    def _build_pane(self, parent, view):
+        """A canvas with its mouse-tool icons overlaid in the top-left corner."""
+        pane = self.panes[view]
+        canvas = tk.Canvas(parent, background=CANVAS_BG, highlightthickness=2,
+                           highlightbackground=CANVAS_BG, highlightcolor=CANVAS_BG)
+        pane.canvas = canvas
+        bar = tk.Frame(canvas, background=BAR_BG, padx=2, pady=2)
+        bar.place(x=6, y=6)
+        button_style = dict(background=BAR_BG, activebackground=BAR_HOVER, relief="flat",
+                            borderwidth=0, highlightthickness=0, padx=4, pady=3,
+                            cursor="hand2")
+        if view == "sample":
+            # One tool only: the icon shows it and switches to this pane.
+            # Kept on self: a Tk variable that is garbage-collected unselects it.
+            self.sample_tool = variable = tk.StringVar(value="edit")
+            command = self.enable_box_edit
+        else:
+            variable, command = self.draw_mode, self._sync_view
+        for value, icon, tip in self.PANE_TOOLS[view]:
+            button = tk.Radiobutton(bar, image=self._icon(icon), variable=variable, value=value,
+                                    indicatoron=False, selectcolor=BAR_SELECTED,
+                                    offrelief="flat", command=command, **button_style)
+            button.pack(side="left", padx=1)
+            Tooltip(button, tip)
+        tk.Frame(bar, width=1, background="#57606a").pack(side="left", fill="y", padx=4, pady=2)
+        for icon, tip, action in (
+                ("trash", "Xóa box/vùng đang chọn (Delete)",
+                 lambda: (self.set_view(view), self.delete_selected())),
+                ("fit", "Vừa ảnh · lăn chuột để zoom", lambda: self.fit(view))):
+            button = tk.Button(bar, image=self._icon(icon), command=action, **button_style)
+            button.pack(side="left", padx=1)
+            Tooltip(button, tip)
+        pane.title = tk.Label(bar, background=BAR_BG, foreground=BAR_TEXT,
+                              font=("Segoe UI", 9, "bold"), padx=6)
+        pane.title.pack(side="left")
+        canvas.bind("<Configure>", lambda _event: self.on_pane_resize(view))
+        canvas.bind("<Button-1>", lambda event: self.press(event, view))
+        canvas.bind("<B1-Motion>", self.drag)
+        canvas.bind("<ButtonRelease-1>", self.release)
+        canvas.bind("<MouseWheel>", lambda event: self.zoom(event, view))
+        if view == "sample":
+            canvas.bind("<Button-3>", self.delete_sample_box)
+        else:
+            self.draw_mode.trace_add("write", lambda *_: self._update_tool_cursor())
+        return canvas
+
+    def _update_tool_cursor(self):
+        cursor = self.TOOL_CURSORS.get(self.draw_mode.get(), "")
+        self.panes["preview"].canvas.configure(cursor=cursor)
+
+    def _update_pane_borders(self):
+        """Outline the pane that clicks, Delete, Ctrl+S and Q/E act on."""
+        for view, pane in self.panes.items():
+            if pane.canvas is None:
+                continue
+            active = view == self.view.get()
+            color = ACTIVE_BORDER if active else CANVAS_BG
+            pane.canvas.configure(highlightbackground=color, highlightcolor=color)
+            pane.title.configure(foreground=BAR_TEXT if active else "#8b949e")
+
+    def on_pane_resize(self, view):
+        pane = self.panes[view]
+        if not pane.zoomed:
+            pane.needs_fit = True
+        self.render_pane(pane)
 
     def _file_tree(self, parent, on_select, on_toggle):
         """A list with a checkbox column: click the box to toggle, the row to open."""
@@ -894,6 +1129,7 @@ class SyntheticLabelTool:
             return False
         self.sample_index, self.sample_path = index, path
         self.sample_image, self.sample_boxes = image, boxes
+        self.panes["sample"].needs_fit = True
         self._asset_cache.clear()
         self.selected_box = None
         self.history.clear()
@@ -922,6 +1158,7 @@ class SyntheticLabelTool:
         self.background_index, self.background_path = index, path
         self.background_image, self.region = image, region
         self.out_lines = out_lines
+        self.panes["preview"].needs_fit = True
         self.selected_box = None
         self.history.clear()
         self._select(self.background_list, index)
@@ -1099,19 +1336,18 @@ class SyntheticLabelTool:
             "Tạo background từ box", "\n".join(lines))
     # ------------------------------------------------------------- edit state
 
+    def _tool_hint(self, view, value):
+        tip = next(tip for tool, _icon, tip in self.PANE_TOOLS[view] if tool == value)
+        return tip.replace("\n", " · ")
+
     def _sync_view(self):
-        target = {"cut_line": "preview", "out_line": "preview", "adjust_horizontal": "preview",
-                  "adjust_arc": "preview"}.get(self.draw_mode.get())
-        # "edit" draws/edits in whichever view is shown, like the toolbar button.
-        if target:
-            self.set_view(target)
+        """A background tool icon was picked: edit the background pane with it."""
+        self.set_view("preview")
+        self.status.set(self._tool_hint("preview", self.draw_mode.get()))
 
     def enable_box_edit(self):
-        self.draw_mode.set("edit")
-        self.selected_box = None
-        self.status.set("Kéo ở chỗ trống để vẽ · bấm vào box để chọn, kéo để di chuyển, "
-                        "kéo góc để resize, kéo nút tròn hoặc Q/E để xoay")
-        self.render()
+        self.set_view("sample")
+        self.status.set(self._tool_hint("sample", "edit"))
 
     def rotate_selected(self, delta):
         """Rotate the selected sample box / region by ``delta`` radians (Q/E keys)."""
@@ -1153,7 +1389,7 @@ class SyntheticLabelTool:
             self.set_view("preview")
         else:
             self.delete_panel.pack_forget()
-        if refresh and hasattr(self, "canvas"):
+        if refresh and self.panes["preview"].canvas is not None:
             self.show_preview()
 
     def set_mode(self, value, refresh=True):
@@ -1345,18 +1581,33 @@ class SyntheticLabelTool:
         self.status.set("Đã xóa; nhấn Ctrl+Z để hoàn tác")
 
     def set_view(self, value):
-        if self.view.get() != value:
-            # selected_box means "sample box N" in one view and "the region"
-            # in the other, so it must not survive a view change.
-            self.selected_box = None
-            self.gesture = None
-        self.view.set(value)
-        self.fit()
+        """Make ``value`` ("sample" or "preview") the pane being edited.
 
-    def current_image(self):
-        if self.view.get() == "sample":
+        Both panes stay visible; this only moves the edit focus (selection,
+        Delete, Ctrl+S, Q/E) and the highlighted border.
+        """
+        if self.view.get() == value:
+            return
+        # selected_box means "sample box N" in one view and "the region"
+        # in the other, so it must not survive a view change.
+        self.selected_box = None
+        self.gesture = None
+        self.view.set(value)
+        self._update_pane_borders()
+        self.render()
+
+    @property
+    def pane(self):
+        """The pane being edited (see set_view)."""
+        return self.panes[self.view.get()]
+
+    def pane_image(self, view):
+        if view == "sample":
             return self.sample_image
         return self.preview_cache or self.background_image
+
+    def current_image(self):
+        return self.pane_image(self.view.get())
 
     # ------------------------------------------------------------- composing
 
@@ -1438,37 +1689,33 @@ class SyntheticLabelTool:
 
     # ---------------------------------------------------------------- canvas
 
-    def fit(self):
-        image = self.current_image()
-        if image:
-            cw, ch = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
-            self.scale = max(.001, min((cw - 30) / image.width, (ch - 30) / image.height))
-            self.ox = (cw - image.width * self.scale) / 2
-            self.oy = (ch - image.height * self.scale) / 2
+    def fit(self, view=None):
+        """Fit one pane (or both) to its image again, dropping any zoom."""
+        for name in ((view,) if view else tuple(self.panes)):
+            self.panes[name].needs_fit = True
         self.render()
 
     def point(self, x, y):
-        return ((x - self.ox) / self.scale, (y - self.oy) / self.scale)
+        return self.pane.point(x, y)
 
     def screen(self, x, y):
-        return x * self.scale + self.ox, y * self.scale + self.oy
+        return self.pane.screen(x, y)
 
-    def rotation_handle(self, box):
-        distance = box.h / 2 + 28 / self.scale
+    def rotation_handle(self, box, pane=None):
+        distance = box.h / 2 + 28 / (pane or self.pane).scale
         return (box.cx + math.sin(box.angle) * distance,
                 box.cy - math.cos(box.angle) * distance)
 
-    def draw_edit_handles(self, box, color):
-        points = [self.screen(x, y) for x, y in box.corners()]
+    def draw_edit_handles(self, pane, box, color):
+        canvas = pane.canvas
+        points = [pane.screen(x, y) for x, y in box.corners()]
         for x, y in points:
-            self.canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5,
-                                         fill=color, outline="white")
-        rx, ry = self.screen(*self.rotation_handle(box))
+            canvas.create_rectangle(x - 5, y - 5, x + 5, y + 5, fill=color, outline="white")
+        rx, ry = pane.screen(*self.rotation_handle(box, pane))
         mx, my = ((points[0][0] + points[1][0]) / 2,
                   (points[0][1] + points[1][1]) / 2)
-        self.canvas.create_line(mx, my, rx, ry, fill=color)
-        self.canvas.create_oval(rx - 6, ry - 6, rx + 6, ry + 6,
-                                fill=color, outline="white")
+        canvas.create_line(mx, my, rx, ry, fill=color)
+        canvas.create_oval(rx - 6, ry - 6, rx + 6, ry + 6, fill=color, outline="white")
 
     def editable_boxes(self):
         if self.view.get() == "sample":
@@ -1482,45 +1729,73 @@ class SyntheticLabelTool:
             self.region = box
 
     def render(self):
-        self.canvas.delete("all")
-        image = self.current_image()
+        for pane in self.panes.values():
+            self.render_pane(pane)
+
+    def render_pane(self, pane):
+        canvas = pane.canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        if pane.view == "sample":
+            path, title, empty = self.sample_path, "Ảnh mẫu", "Chọn ảnh mẫu ở danh sách 1"
+        else:
+            path, title, empty = (self.background_path, "Background / preview",
+                                  "Chọn background ở danh sách 2")
+        pane.title.configure(text=f"{title} · {path.name}" if path else title)
+        image = self.pane_image(pane.view)
         if image is None:
+            canvas.create_text(max(1, canvas.winfo_width()) / 2,
+                               max(1, canvas.winfo_height()) / 2,
+                               text=empty, fill="#8b949e", font=("Segoe UI", 11))
             return
-        display = image.resize((max(1, round(image.width * self.scale)),
-                                max(1, round(image.height * self.scale))), Image.Resampling.BILINEAR)
-        self.photo = ImageTk.PhotoImage(display)
-        self.canvas.create_image(self.ox, self.oy, image=self.photo, anchor="nw")
-        if self.view.get() == "sample":
-            for index, box in enumerate(self.sample_boxes):
-                points = [self.screen(x, y) for x, y in box.corners()]
-                self.canvas.create_polygon(*[v for point in points for v in point], fill="",
-                                           outline=self.COLORS[index % len(self.COLORS)], width=2)
-                self.canvas.create_text(*points[0], text=str(index), anchor="sw", fill="white")
-                if self.selected_box == index:
-                    self.draw_edit_handles(box, self.COLORS[index % len(self.COLORS)])
-            return
+        if pane.needs_fit or pane.fitted_size != image.size:
+            pane.fit(image)
+        pane.draw_image(image)
+        active = pane.view == self.view.get()
+        if pane.view == "sample":
+            self._draw_sample_overlay(pane, active)
+        else:
+            self._draw_preview_overlay(pane, active)
+
+    def _draw_sample_overlay(self, pane, active):
+        canvas = pane.canvas
+        for index, box in enumerate(self.sample_boxes):
+            color = self.COLORS[index % len(self.COLORS)]
+            points = [pane.screen(x, y) for x, y in box.corners()]
+            canvas.create_polygon(*[v for point in points for v in point], fill="",
+                                  outline=color, width=2)
+            canvas.create_text(*points[0], text=str(index), anchor="sw", fill="white")
+            if active and self.selected_box == index:
+                self.draw_edit_handles(pane, box, color)
+
+    def _draw_preview_overlay(self, pane, active):
+        canvas = pane.canvas
         for line in self.out_lines:
-            start, end = (self.screen(*point) for point in line)
-            self.canvas.create_line(*start, *end, fill="#ff40ff", width=3)
+            start, end = (pane.screen(*point) for point in line)
+            canvas.create_line(*start, *end, fill="#ff40ff", width=3)
         for index in self.preview_out_hits():
-            points = [self.screen(x, y) for x, y in self.preview_boxes[index].corners()]
-            self.canvas.create_polygon(*[value for point in points for value in point],
-                                       fill="", outline="#ff5252", width=2)
+            points = [pane.screen(x, y) for x, y in self.preview_boxes[index].corners()]
+            canvas.create_polygon(*[value for point in points for value in point],
+                                  fill="", outline="#ff5252", width=2)
         if self.region:
             region_color = ("#00e5ff" if self.preview_fits() and not self.preview_out_hits()
                             else "#ff5252")
-            points = [self.screen(x, y) for x, y in self.region.corners()]
-            self.canvas.create_polygon(*[value for point in points for value in point],
-                                       fill="", outline=region_color, width=2, dash=(6, 4))
-            if self.selected_box == 0:
-                self.draw_edit_handles(self.region, region_color)
+            points = [pane.screen(x, y) for x, y in self.region.corners()]
+            canvas.create_polygon(*[value for point in points for value in point],
+                                  fill="", outline=region_color, width=2, dash=(6, 4))
+            if active and self.selected_box == 0:
+                self.draw_edit_handles(pane, self.region, region_color)
             scale = self.dimension_scale()
             for line in self.cut_lines:
-                start, end = (self.screen(*local_to_image(point, self.region, scale))
+                start, end = (pane.screen(*local_to_image(point, self.region, scale))
                               for point in line)
-                self.canvas.create_line(*start, *end, fill="#ffca28", width=3)
+                canvas.create_line(*start, *end, fill="#ffca28", width=3)
 
-    def press(self, event):
+    def press(self, event, view=None):
+        if view is not None:
+            # Clicking a pane makes it the one being edited.
+            self.set_view(view)
         image = self.current_image()
         if image is None:
             return
@@ -1530,7 +1805,8 @@ class SyntheticLabelTool:
         if self.mode.get() == "delete_objects" and self.view.get() != "sample":
             self.delete_placed_object(point)
             return
-        kind = self.draw_mode.get()
+        # The sample pane only edits boxes; the tool icons apply to the background.
+        kind = "edit" if self.view.get() == "sample" else self.draw_mode.get()
         if kind == "edit":
             boxes = self.editable_boxes()
             # The undo entry is pushed only once the gesture really changes
@@ -1538,13 +1814,13 @@ class SyntheticLabelTool:
             before = self.history_entry()
             if self.selected_box is not None and self.selected_box < len(boxes):
                 box = boxes[self.selected_box]
-                if math.dist(point, self.rotation_handle(box)) * self.scale < 12:
+                if math.dist(point, self.rotation_handle(box)) * self.pane.scale < 12:
                     self.gesture = {"kind": "edit_rotate", "start": point,
                                     "original": copy.deepcopy(box), "index": self.selected_box,
                                     "snapshot": before, "changed": False}
                     return
                 for corner_index, corner in enumerate(box.corners()):
-                    if math.dist(point, corner) * self.scale < 12:
+                    if math.dist(point, corner) * self.pane.scale < 12:
                         self.gesture = {"kind": "edit_resize", "start": point,
                                         "original": copy.deepcopy(box),
                                         "index": self.selected_box, "corner": corner_index,
@@ -1565,17 +1841,12 @@ class SyntheticLabelTool:
                                 else "target_region", "start": point}
             self.render()
             return
-        needed = {"cut_line": "preview", "out_line": "preview"}.get(kind)
-        if needed and self.view.get() != needed:
-            self.status.set(
-                "Thao tác này dùng trên " + ("ảnh mẫu: bấm 'Xem ảnh mẫu'" if needed == "sample"
-                                             else "background: bấm 'Xem background/preview'"))
-            return
         self.gesture = {"kind": kind, "start": point}
 
     def delete_sample_box(self, event):
-        if self.view.get() != "sample" or self.sample_image is None:
+        if self.sample_image is None:
             return
+        self.set_view("sample")
         point = self.point(event.x, event.y)
         for index in range(len(self.sample_boxes) - 1, -1, -1):
             if self.sample_boxes[index].contains(*point):
@@ -1634,14 +1905,15 @@ class SyntheticLabelTool:
             self.arc_height.set(max(-100, min(100, point[1] - start[1])))
             self.show_preview()
         else:
-            self.canvas.delete("gesture_preview")
+            canvas = self.pane.canvas
+            canvas.delete("gesture_preview")
             if kind in ("cut_line", "out_line"):
-                self.canvas.create_line(*self.screen(*start), *self.screen(*point),
-                                        fill="white" if kind == "cut_line" else "#ff40ff",
-                                        width=2, dash=(5, 3), tags="gesture_preview")
+                canvas.create_line(*self.screen(*start), *self.screen(*point),
+                                   fill="white" if kind == "cut_line" else "#ff40ff",
+                                   width=2, dash=(5, 3), tags="gesture_preview")
             else:
-                self.canvas.create_rectangle(*self.screen(*start), *self.screen(*point),
-                                             outline="white", dash=(5, 3), tags="gesture_preview")
+                canvas.create_rectangle(*self.screen(*start), *self.screen(*point),
+                                        outline="white", dash=(5, 3), tags="gesture_preview")
 
     def release(self, event):
         gesture, self.gesture = self.gesture, None
@@ -1650,7 +1922,7 @@ class SyntheticLabelTool:
         kind, start = gesture["kind"], gesture["start"]
         point = self.point(event.x, event.y)
         if kind in ("sample_box", "target_region") and min(
-                abs(point[0] - start[0]), abs(point[1] - start[1])) * self.scale < 4:
+                abs(point[0] - start[0]), abs(point[1] - start[1])) * self.pane.scale < 4:
             # A click (or a tiny slip of the mouse) on an empty spot only
             # deselects; it must not create a box or replace the region.
             self.render()
@@ -1692,7 +1964,7 @@ class SyntheticLabelTool:
         self.show_preview()
 
     def add_cut_line(self, start, end):
-        if math.dist(start, end) * self.scale < 4:
+        if math.dist(start, end) * self.pane.scale < 4:
             self.status.set("Đường cắt quá ngắn: hãy giữ chuột và kéo để kẻ")
             return
         if self.region is None or self.sample_image is None or self.background_image is None:
@@ -1713,7 +1985,7 @@ class SyntheticLabelTool:
         if self.background_image is None or self.background_path is None:
             self.status.set("Hãy chọn background trước khi kẻ đường out-line")
             return
-        if math.dist(start, end) * self.scale < 4:
+        if math.dist(start, end) * self.pane.scale < 4:
             self.status.set("Đường out-line quá ngắn: hãy giữ chuột và kéo để kẻ")
             return
         width, height = self.background_image.size
@@ -1742,13 +2014,17 @@ class SyntheticLabelTool:
         self.show_preview()
         self.status.set("Đã xóa các đường cắt; Ctrl+Z để hoàn tác")
 
-    def zoom(self, event):
-        image = self.current_image()
+    def zoom(self, event, view=None):
+        """Zoom the pane under the mouse around the cursor (does not change focus)."""
+        pane = self.panes[view] if view else self.pane
+        image = self.pane_image(pane.view)
         if image:
-            point = self.point(event.x, event.y)
-            self.scale = max(.02, min(20, self.scale * (1.15 if event.delta > 0 else 1 / 1.15)))
-            self.ox, self.oy = event.x - point[0] * self.scale, event.y - point[1] * self.scale
-            self.render()
+            point = pane.point(event.x, event.y)
+            pane.scale = max(.02, min(20, pane.scale * (1.15 if event.delta > 0 else 1 / 1.15)))
+            pane.ox = event.x - point[0] * pane.scale
+            pane.oy = event.y - point[1] * pane.scale
+            pane.zoomed = True
+            self.render_pane(pane)
 
     def side_mousewheel(self, event):
         widget = event.widget

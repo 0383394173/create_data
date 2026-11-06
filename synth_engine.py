@@ -31,8 +31,10 @@ CUT_SIDES = ("above", "below")
 AUTO_ERROR_MODES = (
     "spacing", "overlap", "arc", "blur",
     "cut_row_1", "cut_row_2", "cut_both_rows",
-    "delete_objects", "out_line",
+    "delete_objects", "out_line", "shift", "rotation",
 )
+# Modes whose date may leave the region; it only has to stay inside the image.
+LOOSE_MODES = ("out_line", "shift", "rotation")
 # Saved effect states use format 2: cut lines are stored relative to the date
 # (see local_to_image) and index-based data is tied to a sample via box_refs.
 STATE_VERSION = 2
@@ -42,6 +44,13 @@ JITTER_ANGLE_DEG = round(math.degrees(JITTER_ANGLE), 2)
 MAX_JITTER_ANGLE_DEG = 45.0
 MAX_SHIFT_PERCENT = 100.0  # 100 % = the date may sit anywhere inside the region
 MAX_BEND_PERCENT = 100.0   # bend depth, % of the median character height
+# "rotation" error: the date is turned this far past "Góc xoay" (the rotation
+# every other mode may have), up to ROTATION_ERROR_SPAN_DEG further, never past 90°.
+ROTATION_ERROR_GAP_DEG = 5.0
+ROTATION_ERROR_SPAN_DEG = 30.0
+# "shift" error: the date is moved past the farthest normal position (from
+# "Lệch vị trí" plus JITTER_SHIFT) by at least this fraction of its own size.
+SHIFT_ERROR_GAP = .25
 MAX_ATTEMPTS = 100
 MIN_PRINT_CONTRAST = 10  # grey levels between paper and ink
 REGION_FILL = .85        # "Cỡ ký tự theo vùng": date fills this much of the region
@@ -1063,6 +1072,7 @@ class Generator:
         # ±JITTER_SHIFT) around the region centre, and is never bent.
         self.shift_percent = shift_percent
         self.bend_percent = bend_percent
+        self._rotation_ranges = {}  # see rotation_error_range
 
     @classmethod
     def from_settings(cls, settings):
@@ -1366,7 +1376,114 @@ class Generator:
             return "vùng đặt quá thấp để uốn cong date"
         if mode == "out_line" and not target.out_lines:
             return "background chưa có đường out-line"
+        if mode == "rotation" and target.region is not None:
+            low = self.angle_jitter_deg + ROTATION_ERROR_GAP_DEG
+            if low >= 90:
+                return "Góc xoay đã gần 90°, không còn góc nào quá mức"
+            if self.rotation_error_range(code, target) is None:
+                return (f"date xoay từ {low:g}° trở lên không nằm trọn trong ảnh; "
+                        "hãy giảm Góc xoay")
+        if mode == "shift" and target.region is not None and not self.shift_error_options(
+                code, target, default_state("shift"), target.region):
+            return "ảnh không đủ chỗ để dời date quá mức lệch cho phép"
         return None
+
+    def rotation_error_range(self, code, target):
+        """``(low, high)`` degrees of a "rotation" error (either direction), or
+        None when no angle in it fits the image.
+
+        ``high`` is also limited to the largest angle at which the date,
+        centred on the region and with room for the largest bend, still lies
+        inside the image, so the draws rarely need a retry.
+        """
+        low = self.angle_jitter_deg + ROTATION_ERROR_GAP_DEG
+        high = min(90.0, low + ROTATION_ERROR_SPAN_DEG)
+        if low > high:
+            return None
+        region = target.region
+        key = (low, high, self.size_mode, self.bend_percent, target.image.size,
+               (region.cx, region.cy, region.w, region.h, region.angle),
+               tuple((box.cx, box.cy, box.w, box.h, box.angle) for box in code.boxes))
+        cache = self._rotation_ranges
+        if key not in cache:
+            scale = self.scale(code, target)
+            margin = self.bend_limit(code, target) + .5
+            width, height = target.image.size
+
+            def fits(degrees):
+                for sign in (1, -1):
+                    probe = copy.deepcopy(target.region)
+                    probe.angle += sign * math.radians(degrees)
+                    corners = [corner for box in layout_boxes(
+                        code.boxes, probe, "normal", 3, 0.0, scale) for corner in box.corners()]
+                    if all(margin <= x <= width - margin and margin <= y <= height - margin
+                           for x, y in corners):
+                        return True
+                return False
+
+            best, step = None, .5
+            degrees = low
+            while degrees <= high + 1e-9:
+                if not fits(degrees):
+                    break
+                best = degrees
+                degrees += step
+            cache[key] = None if best is None else (low, best)
+        return cache[key]
+
+    def shift_error_options(self, code, target, state, region):
+        """Ways to push the date in ``region`` past the normal shift.
+
+        Each option is ``(ux, uy, now, start, reach)``: a unit direction along
+        one of the target region's axes, the date centre's current offset from
+        the region centre in that direction, the smallest offset that counts
+        as a shift error, and the largest one that keeps the date inside the
+        image. Only options with ``reach >= start`` are returned.
+        """
+        base = target.region
+        cosine, sine = math.cos(base.angle), math.sin(base.angle)
+        # Farthest the always-on jitter (image axes) moves the date along each region axis.
+        jitter_x = JITTER_SHIFT * (base.w * abs(cosine) + base.h * abs(sine))
+        jitter_y = JITTER_SHIFT * (base.w * abs(sine) + base.h * abs(cosine))
+        corners = [corner for box in self.placed_boxes(code, target, state, region)
+                   for corner in box.corners()]
+        width, height = target.image.size
+        fraction = self.shift_percent / 100
+        options = []
+        for ux, uy, half, jitter in ((cosine, sine, base.w / 2, jitter_x),
+                                     (-sine, cosine, base.h / 2, jitter_y)):
+            along = [(x - base.cx) * ux + (y - base.cy) * uy for x, y in corners]
+            extent = max(along) - min(along)
+            center = (max(along) + min(along)) / 2
+            # Same bound as shifted_region: a share of the free room, plus jitter.
+            normal = fraction * max(0.0, 2 * half - extent) / 2 + jitter
+            start = normal + SHIFT_ERROR_GAP * extent
+            for side in (1, -1):
+                room = math.inf
+                for x, y in corners:
+                    for value, step, limit in ((x, side * ux, width), (y, side * uy, height)):
+                        if step > 1e-12:
+                            room = min(room, (limit - .5 - value) / step)
+                        elif step < -1e-12:
+                            room = min(room, (.5 - value) / step)
+                reach = side * center + room
+                if reach >= start:
+                    options.append((side * ux, side * uy, side * center, start, reach))
+        return options
+
+    def shift_error_region(self, code, target, state, region, rng):
+        """Move ``region`` so the date sits past the normal shift on one axis,
+        or return None when there is no room for that."""
+        region = self.shifted_region(code, target, state, region, rng)
+        options = self.shift_error_options(code, target, state, region)
+        if not options:
+            return None
+        ux, uy, now, start, reach = options[rng.randrange(len(options))]
+        move = rng.uniform(start, reach) - now
+        shifted = copy.deepcopy(region)
+        shifted.cx += ux * move
+        shifted.cy += uy * move
+        return shifted
 
     @staticmethod
     def automatic_cut_lines(code, mode, rng):
@@ -1423,6 +1540,10 @@ class Generator:
             state["out_line"] = {"line": rng.randrange(len(target.out_lines)),
                                  "t": rng.random(), "across": rng.random(),
                                  "along": rng.random()}
+        elif mode == "rotation":
+            low, high = self.rotation_error_range(code, target)
+            # Radians from the target region's angle; replaces the normal jitter.
+            state["rotation"] = rng.choice((-1, 1)) * math.radians(rng.uniform(low, high))
         return state
 
     def out_line_region(self, code, target, state, base):
@@ -1553,22 +1674,30 @@ class Generator:
     def generate(self, code, target, job, variant, rng, fingerprints):
         """Compose one new image for ``job``.
 
-        Every mode except "out_line" must fit the region and must not touch an
-        out-line, since that would also be an "out" error. "out_line" must touch
-        a line with at least one character and stay inside the image.
+        Every mode must stay inside the image, and every mode except "out_line"
+        must not touch an out-line, since that would also be an "out" error.
+        "out_line" must touch a line with at least one character. The modes
+        outside LOOSE_MODES must also fit the region; "shift" and "rotation"
+        may leave it, because a date too far off or too tilted usually does.
         """
-        out_mode, touched = False, 0
+        mode, touched = None, 0
         for _attempt in range(MAX_ATTEMPTS):
             # The jitter is drawn before the state, as before out-lines existed,
             # so the other modes still make the same images for the same seed.
             region = self.jittered_region(target.region, rng)
             state = job.make_state(variant, rng)
-            out_mode = state["mode"] == "out_line"
+            mode = state["mode"]
+            if mode == "rotation":
+                region.angle = target.region.angle + state["rotation"]
             # Bend and shift draw only when they are on, after everything
             # else, so a run with both at 0 makes the same images as before.
             self.draw_bend(code, target, state, rng)
-            if out_mode:
+            if mode == "out_line":
                 region = self.out_line_region(code, target, state, region)
+            elif mode == "shift":
+                region = self.shift_error_region(code, target, state, region, rng)
+                if region is None:
+                    continue
             else:
                 region = self.shifted_region(code, target, state, region, rng)
             result = self.compose(code, target, state, region)
@@ -1577,12 +1706,14 @@ class Generator:
             if not result.boxes:
                 continue
             result.out_hits = out_line_hits(result.boxes, target.out_lines)
-            if out_mode:
-                if not result.out_hits or not all(
-                        box.valid(*target.image.size) for box in result.boxes):
+            if mode in LOOSE_MODES:
+                if not all(box.valid(*target.image.size) for box in result.boxes):
                     continue
             elif not all(box_inside_box(box, target.region) for box in result.boxes):
                 continue
+            if mode == "out_line":
+                if not result.out_hits:
+                    continue
             elif result.out_hits:
                 touched += 1
                 continue
@@ -1591,12 +1722,17 @@ class Generator:
                 continue
             fingerprints.add(fingerprint)
             return result
-        if out_mode:
+        if mode == "out_line":
             raise ValueError(f"sau {MAX_ATTEMPTS} lần thử không đặt được date chạm đường "
                              "out-line mà vẫn nằm trọn trong ảnh; hãy kẻ đường xa mép ảnh hơn")
         if touched > MAX_ATTEMPTS // 2:
             raise ValueError(f"sau {MAX_ATTEMPTS} lần thử date vẫn chạm đường out-line; "
                              "hãy dời vùng đặt ra xa đường out-line")
+        if mode in ("shift", "rotation"):
+            what = "lệch" if mode == "shift" else "xoay"
+            raise ValueError(f"sau {MAX_ATTEMPTS} lần thử không đặt được date {what} quá mức "
+                             "mà vẫn nằm trọn trong ảnh; hãy giảm Góc xoay/Lệch vị trí "
+                             "hoặc giảm số lượng")
         raise ValueError(f"sau {MAX_ATTEMPTS} lần thử không tạo được ảnh mới nằm trọn "
                          "trong vùng đặt; hãy nới rộng vùng đặt hoặc giảm số lượng")
 
