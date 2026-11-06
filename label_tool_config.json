@@ -1,5 +1,5 @@
 {
-  "synthetic_output_dir": "D:\\data_cognex\\synthetic_output",
+  "synthetic_output_dir": "D:\\data_cognex\\synthetic_output3",
   "export_count": 30,
   "seed": "",
   "stack_size": 2,
@@ -11,39 +11,32 @@
   "saved_modes": [],
   "batch": {
     "codes": [],
-    "codes_unchecked": [
-      "Image_0054_20261101195100.bmp",
-      "Image_0057_20261101195202.bmp",
-      "Image_0058_20261101195205.bmp",
-      "Image_0059_20261101195208.bmp"
+    "codes_unchecked": [],
+    "backgrounds": [],
+    "backgrounds_unchecked": [
+      "Image_0000_20261105021332_background_000000.png"
     ],
-    "backgrounds": [
-      "Image_0053_20261101195055_background_000000.png",
-      "Image_0054_20261101195100_background_000000.png",
-      "Image_0057_20261101195202_background_000000.png",
-      "Image_0058_20261101195205_background_000000.png",
-      "Image_0059_20261101195208_background_000000.png"
-    ],
-    "backgrounds_unchecked": [],
     "pairing": "all",
-    "max_backgrounds_per_code": 0,
+    "max_backgrounds_per_code": 3,
     "count": 30,
     "count_mode": "per_mode",
     "modes": [
       "auto_spacing",
-      "auto_cut_row_1",
-      "auto_cut_row_2",
-      "auto_delete_objects",
-      "auto_out_line"
-    ],
-    "modes_unchecked": [
       "auto_overlap",
       "auto_arc",
       "auto_blur",
-      "auto_cut_both_rows"
+      "auto_cut_row_1",
+      "auto_cut_row_2",
+      "auto_cut_both_rows",
+      "auto_out_line"
+    ],
+    "modes_unchecked": [
+      "auto_delete_objects"
     ],
     "val_percent": 0,
     "size_mode": "image",
-    "angle_jitter_deg": 15.4
+    "angle_jitter_deg": 15.0,
+    "shift_percent": 30.0,
+    "bend_percent": 30.0
   }
 }

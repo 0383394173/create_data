@@ -10,22 +10,19 @@ one code placed on one target, and a *mode* is one error type.
 from __future__ import annotations
 
 import copy
-import csv
 import functools
 import hashlib
 import json
 import math
 import os
 import random
-import re
 from collections import namedtuple
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
-from label_obb import Box, atomic_write, decode, encode
+from label_obb import Box, decode
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -43,6 +40,8 @@ JITTER_SHIFT = .018      # placement jitter, fraction of the region size
 JITTER_ANGLE = .025      # default placement jitter, radians (±1.43°)
 JITTER_ANGLE_DEG = round(math.degrees(JITTER_ANGLE), 2)
 MAX_JITTER_ANGLE_DEG = 45.0
+MAX_SHIFT_PERCENT = 100.0  # 100 % = the date may sit anywhere inside the region
+MAX_BEND_PERCENT = 100.0   # bend depth, % of the median character height
 MAX_ATTEMPTS = 100
 MIN_PRINT_CONTRAST = 10  # grey levels between paper and ink
 REGION_FILL = .85        # "Cỡ ký tự theo vùng": date fills this much of the region
@@ -50,7 +49,6 @@ REGION_FILL = .85        # "Cỡ ký tự theo vùng": date fills this much of t
 BYTES_PER_PIXEL = .44e6 / (1920 * 480)
 SECONDS_PER_PIXEL = .060 / (1920 * 480)
 CONFIRM_ABOVE = 20000    # ask before generating more images than this
-MANIFEST_FIELDS = ("image", "split", "code", "background", "mode", "variant", "seed")
 MAX_PATH_LENGTH = 259    # Windows MAX_PATH without the terminating NUL
 OUT_LINES_VERSION = 1
 
@@ -193,37 +191,163 @@ def character_asset(source, box, padding=12):
     return Image.composite(shade, white, gate), (left, top), inverted
 
 
-def erase_boxes(source, boxes):
+ERASE_SMOOTH_SIGMA = 4.0    # px; detail finer than this counts as surface texture
+
+
+def _push_pull(image, weight):
+    """Fill pixels with ``weight`` 0 from their neighbours, smoothly.
+
+    Pull: build a pyramid of weighted averages until every pixel is covered.
+    Push: walk back up, keeping known pixels and taking the coarser level's
+    value where the weight is missing. The fill follows the surrounding
+    brightness gradient instead of being one flat colour.
+    """
+    import cv2
+    import numpy as np
+
+    levels = []
+    values, weights = image * weight[..., None], weight.copy()
+    while True:
+        levels.append((values, weights))
+        if weights.min() > 1e-3 or min(weights.shape) <= 2:
+            break
+        values, weights = cv2.pyrDown(values), cv2.pyrDown(weights)
+    values, weights = levels[-1]
+    filled = values / np.maximum(weights, 1e-6)[..., None]
+    for values, weights in reversed(levels[:-1]):
+        height, width = weights.shape
+        coarse = cv2.pyrUp(filled, dstsize=(width, height))
+        known = values / np.maximum(weights, 1e-6)[..., None]
+        alpha = np.clip(weights, 0, 1)[..., None]
+        filled = known * alpha + coarse * (1 - alpha)
+    return filled
+
+
+def _quilt_texture(hole, valid, residual, rng, tile=24):
+    """Texture for ``hole`` quilted from small tiles of nearby clean paper.
+
+    Each tile is copied from a random clean spot close to the hole and
+    blended with a smooth window. Small tiles scramble any structure, so
+    faint print elsewhere cannot reappear as letters; spots whose texture is
+    much stronger than the paper right around the hole (other print, logos,
+    scratches) are never used. Returns ``None`` when no clean paper exists.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = hole.shape
+    half = tile // 2
+    energy = cv2.GaussianBlur((residual ** 2).mean(axis=2), (0, 0), tile / 4)
+    ring = cv2.dilate(hole.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool) & valid
+    reference = np.median(energy[ring]) if ring.any() else np.median(energy[valid])
+    # A tile source must be fully clean: erode the clean map by the tile size.
+    clean = (valid & (energy <= 1.6 * reference)).astype(np.uint8)
+    clean = cv2.erode(clean, np.ones((tile + 1, tile + 1), np.uint8)).astype(bool)
+    clean[:half + 1], clean[height - half - 1:] = False, False
+    clean[:, :half + 1], clean[:, width - half - 1:] = False, False
+    if not clean.any():
+        return None
+    distance = cv2.distanceTransform((~hole).astype(np.uint8), cv2.DIST_L2, 5)
+    reach = 3 * tile
+    while True:
+        pool_y, pool_x = np.nonzero(clean & (distance <= reach))
+        if len(pool_y) >= 50 or reach >= max(height, width):
+            break
+        reach *= 2
+    if not len(pool_y):
+        pool_y, pool_x = np.nonzero(clean)
+
+    window = np.outer(np.hanning(tile + 2)[1:-1], np.hanning(tile + 2)[1:-1]).astype(np.float32)
+    accumulated = np.zeros(residual.shape, np.float32)
+    energy_weight = np.zeros((height, width), np.float32)
+    ys, xs = np.nonzero(hole)
+    step = tile // 2
+    for cy in range(ys.min() - half, ys.max() + half + 1, step):
+        for cx in range(xs.min() - half, xs.max() + half + 1, step):
+            top, left = cy - half, cx - half
+            t0, l0 = max(0, top), max(0, left)
+            t1, l1 = min(height, top + tile), min(width, left + tile)
+            if t0 >= t1 or l0 >= l1 or not hole[t0:t1, l0:l1].any():
+                continue
+            pick = rng.randrange(len(pool_y))
+            sy, sx = pool_y[pick] - half, pool_x[pick] - half
+            w = window[t0 - top:t1 - top, l0 - left:l1 - left]
+            patch = residual[sy + t0 - top:sy + t1 - top, sx + l0 - left:sx + l1 - left]
+            accumulated[t0:t1, l0:l1] += patch * w[..., None]
+            energy_weight[t0:t1, l0:l1] += w ** 2
+    # Divide by the root of the summed squared weights: overlapping random
+    # tiles then keep the same grain strength as one tile.
+    return accumulated / np.sqrt(np.maximum(energy_weight, 1e-6))[..., None]
+
+
+def erase_boxes(source, boxes, seed=0):
     """Return a copy of ``source`` with the print inside ``boxes`` painted over.
 
-    Raises ValueError when no paper can be found around a box.
+    The image is split into a smooth illumination layer and a fine texture
+    layer. Inside the boxes the illumination is interpolated from the
+    surrounding paper (so gradients and vignetting continue through the
+    hole) and the texture is copied from a nearby print-free area (so the
+    patch has the same grain as the paper). This avoids the flat, uniform
+    rectangles a single mean colour leaves behind.
+
+    Raises ValueError when no paper can be found around the boxes.
     """
+    import cv2
+    import numpy as np
+
     source = source.convert("RGB")
-    result = source.copy()
-    gray = source.convert("L")
+    image = np.asarray(source, dtype=np.float32)
+    height, width = image.shape[:2]
+    mask = Image.new("L", source.size, 0)
     for box in boxes:
-        polygon = box.corners()
-        character_mask = Image.new("L", source.size, 0)
-        ImageDraw.Draw(character_mask).polygon(polygon, fill=255)
-        # Cover ink touching the OBB edge, while sampling paper from a
-        # separate outer ring around the character. Both sizes are odd.
-        inner_size = max(5, min(21, (round(min(box.w, box.h) * .12) | 1)))
-        outer_size = max(inner_size + 4, min(41, inner_size * 2 - 1))
-        removal_mask = character_mask.filter(ImageFilter.MaxFilter(inner_size))
-        outer_mask = character_mask.filter(ImageFilter.MaxFilter(outer_size))
-        sample_ring = ImageChops.subtract(outer_mask, removal_mask)
-        threshold = otsu_threshold(gray, sample_ring)
-        bright_paper = gray.point([0 if value <= threshold else 255 for value in range(256)])
-        paper_mask = ImageChops.multiply(sample_ring, bright_paper)
-        if not paper_mask.getbbox():
-            paper_mask = sample_ring
-        if not paper_mask.getbbox():
-            raise ValueError("Không tìm thấy vùng giấy quanh một box ký tự.")
-        paper_color = tuple(round(value) for value in ImageStat.Stat(source, paper_mask).mean)
-        paper_patch = Image.new("RGB", source.size, paper_color)
-        feathered = removal_mask.filter(ImageFilter.GaussianBlur(1.2))
-        result = Image.composite(paper_patch, result, feathered)
-    return result
+        character = Image.new("L", source.size, 0)
+        ImageDraw.Draw(character).polygon(box.corners(), fill=255)
+        # Also cover ink touching the OBB edge (odd filter size).
+        grow = max(5, min(21, (round(min(box.w, box.h) * .12) | 1)))
+        mask = ImageChops.lighter(mask, character.filter(ImageFilter.MaxFilter(grow)))
+    hole = np.asarray(mask) > 0
+    if not hole.any():
+        return source.copy()
+    # Fill narrow gaps between neighbouring characters too: a thin strip of
+    # original paper between two filled areas shows as a seam.
+    gap = 2 * max(5, min(21, max((round(min(box.w, box.h) * .12) | 1) for box in boxes))) + 1
+    hole = cv2.morphologyEx(hole.astype(np.uint8), cv2.MORPH_CLOSE,
+                            np.ones((gap, gap), np.uint8)).astype(bool)
+    # Keep a small margin so the ink's soft halo is not used as paper.
+    valid = ~cv2.dilate(hole.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    if not valid.any():
+        raise ValueError("Không tìm thấy vùng giấy quanh một box ký tự.")
+    weight = valid.astype(np.float32)
+
+    # Illumination layer: blur of the paper only, then filled across the hole.
+    sigma = ERASE_SMOOTH_SIGMA
+    numerator = cv2.GaussianBlur(image * weight[..., None], (0, 0), sigma)
+    denominator = cv2.GaussianBlur(weight, (0, 0), sigma)
+    smooth = numerator / np.maximum(denominator, 1e-6)[..., None]
+    smooth_weight = (denominator > .5).astype(np.float32) * weight
+    illumination = _push_pull(smooth, smooth_weight)
+    residual = np.where(valid[..., None], image - illumination, 0)
+
+    # Texture layer: real grain quilted from clean paper near the boxes.
+    rng = random.Random(seed)
+    tile = max(12, min(32, round(min(min(box.w, box.h) for box in boxes) * .6)))
+    texture = _quilt_texture(hole, valid, residual, rng, tile)
+    ring = cv2.dilate(hole.astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool) & valid
+    target = residual[ring if ring.any() else valid].std(axis=0)
+    if texture is None:
+        # No clean paper large enough: fall back to noise of matched strength.
+        texture = np.random.default_rng(seed).standard_normal(image.shape).astype(np.float32)
+    else:
+        # Clean tiles are slightly smoother than average paper; restore the
+        # grain strength of the paper right around the boxes (bounded gain).
+        target = np.clip(target / np.maximum(texture[hole].std(axis=0), 1e-3), 1.0, 1.6)
+    texture = texture * target
+
+    filled = np.clip(illumination + texture, 0, 255)
+    alpha = cv2.GaussianBlur(hole.astype(np.float32), (0, 0), 1.2)
+    alpha = np.maximum(alpha, hole.astype(np.float32) * .999)[..., None]
+    result = image * (1 - alpha) + filled * alpha
+    return Image.fromarray(np.round(result).astype(np.uint8), "RGB")
 
 
 # ---------------------------------------------------------------------- geometry
@@ -298,11 +422,26 @@ def overlapping_boxes(boxes, limit=.3):
 
 
 def layout_boxes(boxes, region, mode, stack_size, arc_height,
-                 dimension_scale=1.0, spacing_groups=(), group_x_factor=1.0):
-    """Return copies of ``boxes`` laid out for ``mode`` and moved into ``region``.
+                 dimension_scale=1.0, spacing_groups=(), group_x_factor=1.0, bend=0.0):
+    """Return the label boxes of ``boxes`` laid out for ``mode`` in ``region``.
+
+    These are the boxes as drawn: when the date is curved (``arc`` mode or a
+    ``bend``) they bound the bent characters. See ``layout_date``.
+    """
+    straight, curve = layout_date(boxes, region, mode, stack_size, arc_height,
+                                  dimension_scale, spacing_groups, group_x_factor, bend)
+    return [curve.box(box) for box in straight] if curve else straight
+
+
+def layout_date(boxes, region, mode, stack_size, arc_height,
+                dimension_scale=1.0, spacing_groups=(), group_x_factor=1.0, bend=0.0):
+    """Return ``(straight_boxes, curve)`` for ``mode`` moved into ``region``.
 
     Characters are resized only by ``dimension_scale`` (sample → background
-    pixels); the error effects move boxes but never resize them.
+    pixels); the error effects move boxes but never resize them. The curve
+    (``arc_height`` in arc mode plus ``bend``, background px) is not applied
+    to the boxes: it is a ``Curve`` that bends the pixels of the date, so a
+    single box curves as well. ``curve`` is None for a straight date.
     """
     placed = copy.deepcopy(boxes)
     source_left, source_top, source_right, source_bottom = boxes_bounds(placed)
@@ -342,16 +481,12 @@ def layout_boxes(boxes, region, mode, stack_size, arc_height,
                 for box in stack:
                     box.cx = center_x
                 cursor += width + 1
-    elif mode == "arc":
-        left = min(box.cx for box in placed)
-        right = max(box.cx for box in placed)
-        middle = (left + right) / 2
-        half_width = max((right - left) / 2, 1)
-        for box in placed:
-            normalized_x = (box.cx - middle) / half_width
-            box.cy += arc_height * normalized_x ** 2
+    depth = (arc_height if mode == "arc" else 0.0) + bend
+    curve = Curve.around(placed, depth) if abs(depth) > 1e-9 else None
 
-    left, top, right, bottom = boxes_bounds(placed)
+    # Centre the date as drawn (curve included) on the region.
+    drawn = [curve.box(box) for box in placed] if curve else placed
+    left, top, right, bottom = boxes_bounds(drawn)
     target_x, target_y = region.cx, region.cy
     source_x, source_y = (left + right) / 2, (top + bottom) / 2
     cosine, sine = math.cos(region.angle), math.sin(region.angle)
@@ -360,7 +495,100 @@ def layout_boxes(boxes, region, mode, stack_size, arc_height,
         box.cx = target_x + cosine * dx - sine * dy
         box.cy = target_y + sine * dx + cosine * dy
         box.angle += region.angle
-    return placed
+    if curve:
+        dx, dy = curve.cx - source_x, curve.cy - source_y
+        curve = Curve(target_x + cosine * dx - sine * dy, target_y + sine * dx + cosine * dy,
+                      curve.angle + region.angle, curve.half, curve.depth)
+    return placed, curve
+
+
+class Curve:
+    """A date bent along a parabola, as print on a curved surface looks.
+
+    In a frame centred on the straight date (u along the text, v across it),
+    every pixel moves across the text by ``depth · (u / half)²``: the middle
+    stays, the two ends of the date move by ``depth`` (positive = down, like
+    a positive arc). The bend is applied to the pixels, not to box centres,
+    so one box, or a few, curve as well as a whole date. Points only move
+    across the text, so the warp can never fold, however strong.
+    """
+
+    def __init__(self, cx, cy, angle, half, depth):
+        self.cx, self.cy, self.angle = cx, cy, angle
+        self.half, self.depth = max(half, 1.0), depth
+        self.ux, self.uy = math.cos(angle), math.sin(angle)
+        self.nx, self.ny = -self.uy, self.ux     # across the text
+
+    @classmethod
+    def around(cls, boxes, depth):
+        """The curve spanning ``boxes`` from end to end along the text."""
+        angle = text_angle(boxes)
+        ux, uy = math.cos(angle), math.sin(angle)
+        corners = [corner for box in boxes for corner in box.corners()]
+        along = [x * ux + y * uy for x, y in corners]
+        across = [y * ux - x * uy for x, y in corners]
+        middle_u = (min(along) + max(along)) / 2
+        middle_v = (min(across) + max(across)) / 2
+        cx, cy = ux * middle_u - uy * middle_v, uy * middle_u + ux * middle_v
+        return cls(cx, cy, angle, (max(along) - min(along)) / 2, depth)
+
+    def shift(self, x, y):
+        """Across-text displacement at image point(s) ``x, y`` (numpy ok)."""
+        u = (x - self.cx) * self.ux + (y - self.cy) * self.uy
+        return self.depth * (u / self.half) ** 2
+
+    def point(self, x, y):
+        offset = self.shift(x, y)
+        return x + self.nx * offset, y + self.ny * offset
+
+    def box(self, box, samples=12):
+        """The OBB of ``box`` after bending, at the box's own angle.
+
+        The characters only shear across the text, so their strokes keep
+        their direction; the box grows to enclose the bent outline.
+        """
+        corners = box.corners()
+        outline = [(x0 + (x1 - x0) * t / samples, y0 + (y1 - y0) * t / samples)
+                   for (x0, y0), (x1, y1) in zip(corners, corners[1:] + corners[:1])
+                   for t in range(samples)]
+        bent = [self.point(x, y) for x, y in outline]
+        cosine, sine = math.cos(box.angle), math.sin(box.angle)
+        along = [x * cosine + y * sine for x, y in bent]
+        across = [-x * sine + y * cosine for x, y in bent]
+        mid_a, mid_c = (min(along) + max(along)) / 2, (min(across) + max(across)) / 2
+        return Box(box.cls, cosine * mid_a - sine * mid_c, sine * mid_a + cosine * mid_c,
+                   max(along) - min(along), max(across) - min(across), box.angle)
+
+    def warp(self, image, x, y):
+        """Bend an RGB tile whose top-left pixel sits at image ``(x, y)``.
+
+        Returns ``(bent_tile, new_x, new_y)``; uncovered pixels are white,
+        which leaves the background unchanged when multiplied onto it.
+        """
+        import cv2
+        import numpy as np
+
+        width, height = image.size
+        tile_corners = ((x, y), (x + width, y), (x, y + height), (x + width, y + height))
+        along = [(cx - self.cx) * self.ux + (cy - self.cy) * self.uy for cx, cy in tile_corners]
+        low, high = min(along), max(along)
+        shifts = [self.depth * (u / self.half) ** 2 for u in (low, high)]
+        if low < 0 < high:
+            shifts.append(0.0)
+        dxs = [self.nx * s for s in shifts]
+        dys = [self.ny * s for s in shifts]
+        left, top = math.floor(x + min(dxs)), math.floor(y + min(dys))
+        right = math.ceil(x + width + max(dxs))
+        bottom = math.ceil(y + height + max(dys))
+        grid_x, grid_y = np.meshgrid(np.arange(left, right, dtype=np.float32),
+                                     np.arange(top, bottom, dtype=np.float32))
+        # u does not change, so the inverse map is exact: undo the shift.
+        offset = self.shift(grid_x, grid_y)
+        map_x = (grid_x - self.nx * offset - x).astype(np.float32)
+        map_y = (grid_y - self.ny * offset - y).astype(np.float32)
+        bent = cv2.remap(np.asarray(image.convert("RGB")), map_x, map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        return Image.fromarray(bent, "RGB"), left, top
 
 
 def box_inside_box(inner, outer, tolerance=1e-6):
@@ -803,12 +1031,10 @@ def code_mode_problem(code, mode):
     if not boxes:
         return "chưa có box"
     rows = split_rows(boxes)
-    if mode in ("spacing", "arc", "delete_objects") and len(boxes) < 2:
+    if mode in ("spacing", "delete_objects") and len(boxes) < 2:
         return "cần ít nhất 2 box"
     if mode == "overlap" and max(map(len, rows)) < 2:
         return "không hàng nào có từ 2 box trở lên"
-    if mode == "arc" and max(box.cx for box in boxes) - min(box.cx for box in boxes) < 1:
-        return "các box thẳng hàng dọc, không uốn cong được"
     if mode in ("cut_row_2", "cut_both_rows") and len(rows) < 2:
         return "date chỉ có 1 hàng (đã có cut_row_1)"
     return None
@@ -829,14 +1055,19 @@ class Generator:
     """Composes synthetic images for any code × target pair."""
 
     def __init__(self, size_mode="image", region_fill=REGION_FILL,
-                 angle_jitter_deg=JITTER_ANGLE_DEG):
+                 angle_jitter_deg=JITTER_ANGLE_DEG, shift_percent=0.0, bend_percent=0.0):
         self.size_mode = size_mode
         self.region_fill = region_fill
         self.angle_jitter_deg = angle_jitter_deg
+        # 0 keeps the old placement: the date only rotates (and moves by
+        # ±JITTER_SHIFT) around the region centre, and is never bent.
+        self.shift_percent = shift_percent
+        self.bend_percent = bend_percent
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(settings.size_mode, angle_jitter_deg=settings.angle_jitter_deg)
+        return cls(settings.size_mode, angle_jitter_deg=settings.angle_jitter_deg,
+                   shift_percent=settings.shift_percent, bend_percent=settings.bend_percent)
 
     @property
     def angle_jitter(self):
@@ -891,12 +1122,19 @@ class Generator:
 
     # ------------------------------------------------------------- composing
 
-    def placed_boxes(self, code, target, state, region):
+    def placement(self, code, target, state, region):
+        """``(straight_boxes, curve)`` of ``state``; see ``layout_date``."""
         mode = state["mode"]
         effect = state["last_effect_mode"] if mode == "delete_objects" else mode
-        return layout_boxes(code.boxes, region, effect, state["stack_size"],
-                            state["arc_height"], self.scale(code, target),
-                            state["spacing_groups"], state["group_x_factor"])
+        return layout_date(code.boxes, region, effect, state["stack_size"],
+                           state["arc_height"], self.scale(code, target),
+                           state["spacing_groups"], state["group_x_factor"],
+                           state.get("bend", 0.0))
+
+    def placed_boxes(self, code, target, state, region):
+        """Label boxes of ``state`` as drawn (bent characters included)."""
+        straight, curve = self.placement(code, target, state, region)
+        return [curve.box(box) for box in straight] if curve else straight
 
     def cut_lines_in_image(self, code, target, state, region):
         mode = state["mode"]
@@ -930,7 +1168,7 @@ class Generator:
             return Composition(target.image if target is not None else None)
         mode = state["mode"]
         effect = state["last_effect_mode"] if mode == "delete_objects" else mode
-        placed = self.placed_boxes(code, target, state, region)
+        placed, curve = self.placement(code, target, state, region)
         # Deletions belong to the delete mode only; other modes show every object.
         deleted = state["deleted_indices"] if mode == "delete_objects" else ()
         cut_side = state["cut_side"]
@@ -973,6 +1211,10 @@ class Generator:
                 shade = shade.filter(ImageFilter.GaussianBlur(radius))
             x = round(target_box.cx + rotated_offset[0] - shade.width / 2)
             y = round(target_box.cy + rotated_offset[1] - shade.height / 2)
+            if curve:
+                # Bend the character's pixels, so even one box is curved.
+                shade, x, y = curve.warp(shade, x, y)
+                target_box = curve.box(target_box)
             area = (max(0, x), max(0, y),
                     min(canvas.width, x + shade.width), min(canvas.height, y + shade.height))
             visible = area[2] > area[0] and area[3] > area[1]
@@ -1031,8 +1273,6 @@ class Generator:
         elif mode == "arc":
             if abs(state["arc_height"]) < .5:
                 return "Độ cong đang bằng 0."
-            if len(boxes) < 2:
-                return "Cần ít nhất 2 box để uốn cong."
         elif mode == "cut":
             if state["cut_side"] not in CUT_SIDES:
                 return "Hãy chọn xóa phía trên hoặc phía dưới đường cắt."
@@ -1086,7 +1326,7 @@ class Generator:
             return None, problem
         mode = state["mode"]
         effect = state["last_effect_mode"] if mode == "delete_objects" else mode
-        if effect in ("overlap", "spacing", "arc") and len(code.boxes) < 2:
+        if effect in ("overlap", "spacing") and len(code.boxes) < 2:
             return None, "cần ít nhất 2 box"
         if effect == "cut" and target.region is not None and \
                 self.cut_count(code, target, state) == 0:
@@ -1201,7 +1441,8 @@ class Generator:
         ux, uy = ((x2 - x1) / length, (y2 - y1) / length) if length > 1e-9 else (1.0, 0.0)
         nx, ny = -uy, ux
         probe = Box(base.cls, 0.0, 0.0, base.w, base.h, base.angle)
-        placed = layout_boxes(code.boxes, probe, "normal", 3, 0.0, self.scale(code, target))
+        placed = layout_boxes(code.boxes, probe, "normal", 3, 0.0, self.scale(code, target),
+                              bend=state.get("bend", 0.0))
         corners = [corner for box in placed for corner in box.corners()]
         across = [x * nx + y * ny for x, y in corners]
         along = [x * ux + y * uy for x, y in corners]
@@ -1256,6 +1497,59 @@ class Generator:
         jittered.angle += rng.uniform(-limit, limit)
         return jittered
 
+    def bend_limit(self, code, target):
+        """Largest bend depth in background px (``bend_percent`` of the
+        median character height)."""
+        if not code.boxes:
+            return 0.0
+        heights = sorted(box.h for box in code.boxes)
+        return heights[len(heights) // 2] * self.scale(code, target) * self.bend_percent / 100
+
+    def draw_bend(self, code, target, state, rng):
+        """Give ``state`` a random bend; nothing is drawn when bending is off."""
+        if self.bend_percent <= 0:
+            return
+        depth = rng.uniform(-1, 1) * self.bend_limit(code, target)
+        effect = state["last_effect_mode"] if state["mode"] == "delete_objects" else state["mode"]
+        if effect == "arc":
+            # The opposite sign would flatten the arc error, so add to it instead.
+            depth = math.copysign(depth, state["arc_height"])
+        state["bend"] = depth
+
+    def shifted_region(self, code, target, state, region, rng):
+        """Move ``region`` (and so the date) to a random spot inside the target
+        region; nothing is drawn when shifting is off.
+
+        The room is measured on the date as it will be drawn (mode layout,
+        bend and rotation included), in the target region's axes. At 100 %
+        the date may end up anywhere it still fits; at x % the offset is
+        limited to x % of the room on each side.
+        """
+        if self.shift_percent <= 0:
+            return region
+        base = target.region
+        cosine, sine = math.cos(base.angle), math.sin(base.angle)
+        xs, ys = [], []
+        for box in self.placed_boxes(code, target, state, region):
+            for x, y in box.corners():
+                dx, dy = x - base.cx, y - base.cy
+                xs.append(dx * cosine + dy * sine)
+                ys.append(-dx * sine + dy * cosine)
+        fraction = self.shift_percent / 100
+        offsets = []
+        for low_edge, high_edge, half in ((min(xs), max(xs), base.w / 2),
+                                          (min(ys), max(ys), base.h / 2)):
+            # Half a pixel of margin so rounding does not push a box outside.
+            low = (-half + .5 - low_edge) * fraction
+            high = (half - .5 - high_edge) * fraction
+            # Always draw, so both axes use the same draws whether or not they fit.
+            t = rng.random()
+            offsets.append(low + (high - low) * t if low <= high else 0.0)
+        shifted = copy.deepcopy(region)
+        shifted.cx += offsets[0] * cosine - offsets[1] * sine
+        shifted.cy += offsets[0] * sine + offsets[1] * cosine
+        return shifted
+
     def generate(self, code, target, job, variant, rng, fingerprints):
         """Compose one new image for ``job``.
 
@@ -1270,8 +1564,13 @@ class Generator:
             region = self.jittered_region(target.region, rng)
             state = job.make_state(variant, rng)
             out_mode = state["mode"] == "out_line"
+            # Bend and shift draw only when they are on, after everything
+            # else, so a run with both at 0 makes the same images as before.
+            self.draw_bend(code, target, state, rng)
             if out_mode:
                 region = self.out_line_region(code, target, state, region)
+            else:
+                region = self.shifted_region(code, target, state, region, rng)
             result = self.compose(code, target, state, region)
             if result.blank:
                 raise ValueError(f"box {result.blank} không có nét in")
@@ -1314,9 +1613,10 @@ class BatchSettings:
     # Unticked mode names. When set it wins over ``modes``, so a mode saved
     # after the last batch is included by default.
     modes_off: list | None = None
-    val_percent: int = 20
     size_mode: str = "image"             # "image" | "region"
     angle_jitter_deg: float = JITTER_ANGLE_DEG  # date rotated by up to ± this
+    shift_percent: float = 0.0           # date moved by up to this % of the region's room
+    bend_percent: float = 0.0            # date bent by up to ± this % of a character height
 
     @classmethod
     def from_config(cls, data):
@@ -1330,8 +1630,7 @@ class BatchSettings:
             settings.count_mode = data["count_mode"]
         if data.get("size_mode") in ("image", "region"):
             settings.size_mode = data["size_mode"]
-        for name, low, high in (("max_backgrounds_per_code", 0, 10000), ("count", 1, 100000),
-                                ("val_percent", 0, 90)):
+        for name, low, high in (("max_backgrounds_per_code", 0, 10000), ("count", 1, 100000)):
             try:
                 setattr(settings, name, max(low, min(high, int(data[name]))))
             except (KeyError, TypeError, ValueError):
@@ -1342,6 +1641,14 @@ class BatchSettings:
                 settings.angle_jitter_deg = max(0.0, min(MAX_JITTER_ANGLE_DEG, angle))
         except (KeyError, TypeError, ValueError):
             pass
+        for name, high in (("shift_percent", MAX_SHIFT_PERCENT),
+                           ("bend_percent", MAX_BEND_PERCENT)):
+            try:
+                value = float(data[name])
+                if math.isfinite(value):
+                    setattr(settings, name, max(0.0, min(high, value)))
+            except (KeyError, TypeError, ValueError):
+                pass
         if isinstance(data.get("modes"), list):
             settings.modes = [str(name) for name in data["modes"]]
         if isinstance(data.get("modes_unchecked"), list):
@@ -1378,8 +1685,6 @@ class BatchPlan:
     settings: BatchSettings
     modes: list                                  # column order
     pairs: list                                  # every pair, valid or not
-    split_by: str | None = None                  # "code" | "background" | "image" | None
-    split: dict = field(default_factory=dict)    # code/background name → "train"/"val"
     warnings: list = field(default_factory=list)
 
     @property
@@ -1398,16 +1703,6 @@ class BatchPlan:
                 if count:
                     yield pair, mode, count
 
-    def split_of(self, pair, mode, variant):
-        if self.split_by is None:
-            return None
-        if self.split_by == "code":
-            return self.split.get(pair.code.name, "train")
-        if self.split_by == "background":
-            return self.split.get(pair.target.name, "train")
-        rng = task_rng(self.seed, pair.code.name, pair.target.name, f"split:{mode}", variant)
-        return "val" if rng.random() * 100 < self.settings.val_percent else "train"
-
     def estimate(self):
         """``(images, bytes, seconds)`` expected for this plan."""
         pixels = sum(pair.target.image.width * pair.target.image.height * pair.total
@@ -1423,43 +1718,8 @@ def all_mode_names(saved_modes):
         saved["name"] for saved in saved_modes]
 
 
-def _split_names(weights, percent, seed, salt, previous=None):
-    """Assign each name to "train" or "val".
-
-    ``weights`` maps a name (code or background) to its number of images.
-    Names are taken in a seeded random order and put in val while that brings
-    the val share of the images closer to ``percent``; each split gets at
-    least one name. ``previous`` holds assignments from earlier runs into the
-    same folder, which are kept so an image's split never changes.
-    """
-    names = sorted(weights)
-    split = {name: value for name, value in (previous or {}).items() if name in weights}
-    fresh = [name for name in names if name not in split]
-    random.Random(f"{seed}:{salt}").shuffle(fresh)
-    total = sum(weights.values()) or 1
-    goal = total * percent / 100
-    val = sum(weights[name] for name, value in split.items() if value == "val")
-    for name in fresh:
-        if "val" not in split.values() or abs(val + weights[name] - goal) < abs(val - goal):
-            split[name] = "val"
-            val += weights[name]
-        else:
-            split[name] = "train"
-    if "train" not in split.values():
-        # Everything ended in val: move the smallest fresh name back to train.
-        movable = [name for name in fresh if split[name] == "val"]
-        if movable:
-            split[min(movable, key=lambda name: (weights[name], name))] = "train"
-    return split
-
-
-def plan_batch(codes, targets, saved_modes, settings, seed, generator=None,
-               previous_split=None):
-    """Plan which images a batch makes, without composing any image.
-
-    ``previous_split`` is ``(split_by, {name: split})`` read from an earlier
-    run's manifest in the same output folder.
-    """
+def plan_batch(codes, targets, saved_modes, settings, seed, generator=None):
+    """Plan which images a batch makes, without composing any image."""
     generator = generator or Generator.from_settings(settings)
     modes = settings.selected_modes(all_mode_names(saved_modes))
     plan = BatchPlan(seed, settings, modes, [])
@@ -1529,249 +1789,63 @@ def plan_batch(codes, targets, saved_modes, settings, seed, generator=None,
             if base + (position < extra):
                 pair.counts[mode] = base + (position < extra)
 
-    _plan_split(plan, previous_split)
     return plan
 
 
-def _plan_split(plan, previous_split):
-    percent = plan.settings.val_percent
-    used = [pair for pair in plan.valid_pairs if pair.total]
-    if percent <= 0 or not used:
-        return
-    previous_by, previous = previous_split or (None, {})
-    codes, backgrounds = {}, {}
-    for pair in used:
-        codes[pair.code.name] = codes.get(pair.code.name, 0) + pair.total
-        backgrounds[pair.target.name] = backgrounds.get(pair.target.name, 0) + pair.total
-    if len(codes) >= 2:
-        plan.split_by = "code"
-        plan.split = _split_names(codes, percent, plan.seed, "split:code",
-                                  previous if previous_by == "code" else None)
-    elif len(backgrounds) >= 2:
-        plan.split_by = "background"
-        plan.split = _split_names(backgrounds, percent, plan.seed, "split:background",
-                                  previous if previous_by == "background" else None)
-        plan.warnings.append("Chỉ có 1 code: tập val được tách theo background, nên val "
-                             "vẫn chứa ký tự của code dùng để train.")
-    else:
-        plan.split_by = "image"
-        plan.warnings.append("Chỉ có 1 code và 1 background: tập val được tách ngẫu nhiên "
-                             "theo ảnh, nên chỉ đo được mô hình trên dữ liệu rất giống train.")
-        return
-    weights = codes if plan.split_by == "code" else backgrounds
-    share = 100 * sum(weight for name, weight in weights.items()
-                      if plan.split.get(name) == "val") / max(1, sum(weights.values()))
-    if abs(share - percent) > 10:
-        plan.warnings.append(f"Tập val chiếm {share:.0f} % số ảnh (yêu cầu {percent} %) vì "
-                             f"phải giữ trọn mỗi {plan.split_by} trong một tập.")
-
-
 # ---------------------------------------------------------------------- running
-
-def existing_layout(out):
-    """``"flat"``, ``"split"`` or None for what an output folder already holds."""
-    images = Path(out) / "images"
-    if not images.is_dir():
-        return None
-    if (images / "train").is_dir() or (images / "val").is_dir():
-        return "split"
-    if any(path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-           for path in images.iterdir()):
-        return "flat"
-    return None
-
-
-def layout_conflict(out, val_percent):
-    """Return why ``out`` cannot take this export's layout, or None."""
-    current = existing_layout(out)
-    wanted = "split" if val_percent > 0 else "flat"
-    if current is None or current == wanted:
-        return None
-    if current == "flat":
-        return ("Thư mục đã có data dạng phẳng (images/ + labels/); không trộn với dạng "
-                "train/val. Hãy chọn thư mục mới hoặc đặt tập val = 0 %.")
-    return ("Thư mục đã có data dạng train/val; không trộn với dạng phẳng. "
-            "Hãy chọn thư mục mới hoặc đặt tập val > 0 %.")
-
-
-def read_manifest(out):
-    path = Path(out) / "manifest.csv"
-    if not path.exists():
-        return []
-    with open(path, newline="", encoding="utf-8") as handle:
-        return [row for row in csv.DictReader(handle)]
-
-
-def previous_split(rows):
-    """``(split_by, {name: split})`` recorded in an earlier manifest."""
-    by_code, by_background = {}, {}
-    for row in rows:
-        if row.get("split") in ("train", "val"):
-            by_code.setdefault(row.get("code", ""), set()).add(row["split"])
-            by_background.setdefault(row.get("background", ""), set()).add(row["split"])
-    if by_code and all(len(splits) == 1 for splits in by_code.values()):
-        return "code", {name: next(iter(splits)) for name, splits in by_code.items()}
-    if by_background and all(len(splits) == 1 for splits in by_background.values()):
-        return "background", {name: next(iter(splits)) for name, splits in by_background.items()}
-    return None, {}
-
 
 @dataclass
 class BatchResult:
     out: Path
     seed: int
     made: dict = field(default_factory=dict)       # mode → images written
-    resumed: int = 0                               # images already written, skipped
     failures: list = field(default_factory=list)
     error: str | None = None
     cancelled: bool = False
-    split_counts: dict = field(default_factory=dict)
 
     @property
     def total(self):
         return sum(self.made.values())
 
 
-def write_dataset_metadata(out, split):
-    if not (out / "classes.txt").exists():
-        atomic_write(out / "classes.txt", "date\n")
-    yaml_path = out / "data.yaml"
-    if split:
-        atomic_write(yaml_path, "path: " + json.dumps(out.as_posix())
-                     + "\ntrain: images/train\nval: images/val\nnc: 1\nnames:\n  0: date\n")
-        return
-    if not yaml_path.exists():
-        atomic_write(yaml_path, "path: " + json.dumps(out.as_posix())
-                     + "\ntrain: images\nval: images\nnc: 1\nnames:\n  0: date\n")
-        return
-    # Keep an existing dataset's metadata, but Ultralytics needs a val split.
-    text = yaml_path.read_text(encoding="utf-8-sig")
-    if not re.search(r"^val\s*:", text, re.MULTILINE):
-        if re.search(r"^train\s*:.*$", text, re.MULTILINE):
-            text = re.sub(r"^(train\s*:.*)$", r"\1\nval: images", text,
-                          count=1, flags=re.MULTILINE)
-        else:
-            text = text.rstrip("\n") + "\nval: images\n"
-        atomic_write(yaml_path, text)
-
-
-def write_out_lines_index(out, plan):
-    """Record each background's out-lines in ``out/out_lines.json``.
-
-    Generated images keep their background's pixel frame, so an automatic
-    "out" check can apply ``out_line_hits`` with these lines to the detected
-    boxes of any image whose manifest row names that background. Entries of
-    earlier runs are kept.
-    """
-    targets = {pair.target.name: pair.target for pair, _mode, _count in plan.tasks()
-               if pair.target.out_lines}
-    if not targets:
-        return
-    path = out / "out_lines.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        data = {}
-    for name, target in sorted(targets.items()):
-        data[name] = {"size": list(target.image.size),
-                      "lines": [[[round(x, 2), round(y, 2)] for x, y in line]
-                                for line in target.out_lines]}
-    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-
-
-def _fingerprint_file(path):
-    with Image.open(path) as opened:
-        return hashlib.sha256(opened.convert("RGB").tobytes()).digest()
-
-
 def run_batch(plan, out, generator=None, progress=None):
-    """Write every image of ``plan`` into ``out``.
+    """Write every image of ``plan`` into ``out`` as PNG files, nothing else.
 
     ``progress(done, total, text)`` is called after each image; returning
-    False cancels the run. Images already listed in ``manifest.csv`` for the
-    same seed are skipped, so a cancelled run can be resumed.
+    False cancels the run. Numbers continue after the files already in
+    ``out``, so a second run adds images instead of overwriting them.
     """
     out = Path(out)
     generator = generator or Generator.from_settings(plan.settings)
-    split_layout = plan.settings.val_percent > 0
     result = BatchResult(out, plan.seed)
-    rows = read_manifest(out)
-    written = {}
-    for row in rows:
-        if row.get("seed") == str(plan.seed):
-            key = (row.get("code"), row.get("background"), row.get("mode"), row.get("variant"))
-            written[key] = row
     total, done = plan.total, 0
-    manifest_path = out / "manifest.csv"
-    handle = None
-    splits = ("train", "val") if split_layout else (None,)
-    folders = {}
-    for split in splits:
-        folders[split] = (out / "images" / split if split else out / "images",
-                          out / "labels" / split if split else out / "labels")
-    longest = max((len(str(labels_dir / f"synthetic_{pair.target.stem}_{pair.code.stem}"
-                                         f"_{mode}_000000.txt.tmp"))
-                   for pair, mode, _count in plan.tasks()
-                   for _images_dir, labels_dir in folders.values()), default=0)
+    longest = max((len(str(out / f"synthetic_{pair.target.stem}_{pair.code.stem}"
+                                 f"_{mode}_000000.png"))
+                   for pair, mode, _count in plan.tasks()), default=0)
     if os.name == "nt" and longest >= MAX_PATH_LENGTH:
         result.error = (f"đường dẫn file sẽ dài {longest} ký tự, vượt giới hạn "
                         f"{MAX_PATH_LENGTH} của Windows; hãy chọn thư mục xuất ngắn hơn "
                         "(ví dụ D:\\out) hoặc đổi tên ảnh ngắn hơn")
         return result
     try:
-        for images_dir, labels_dir in folders.values():
-            images_dir.mkdir(parents=True, exist_ok=True)
-            labels_dir.mkdir(parents=True, exist_ok=True)
-        new_manifest = not manifest_path.exists()
-        handle = open(manifest_path, "a", newline="", encoding="utf-8")
-        writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
-        if new_manifest:
-            writer.writeheader()
+        out.mkdir(parents=True, exist_ok=True)
         for pair, mode, count in plan.tasks():
             if result.cancelled:
                 break
             code, target = pair.code, pair.target
             job = pair.jobs[mode]
             prefix = f"synthetic_{target.stem}_{code.stem}_{mode}"
-            number = first_free_number(prefix, [
-                (directory, suffix) for images_dir, labels_dir in folders.values()
-                for directory, suffix in ((images_dir, ".png"), (labels_dir, ".txt"))])
-            fingerprints, pending_fingerprints = set(), []
+            number = first_free_number(prefix, [(out, ".png")])
+            fingerprints = set()
             made = 0
             try:
                 for variant in range(count):
-                    key = (code.name, target.name, mode, str(variant))
-                    row = written.get(key)
-                    if row and (out / row["image"]).exists():
-                        pending_fingerprints.append(out / row["image"])
-                        result.resumed += 1
-                        done += 1
-                        continue
-                    if pending_fingerprints:
-                        # Resuming: the earlier variants must still count as
-                        # taken, exactly as in an uninterrupted run.
-                        fingerprints.update(_fingerprint_file(path) for path in pending_fingerprints)
-                        pending_fingerprints = []
                     rng = task_rng(plan.seed, code.name, target.name, mode, variant)
                     composition = generator.generate(code, target, job, variant, rng, fingerprints)
-                    split = plan.split_of(pair, mode, variant)
-                    images_dir, labels_dir = folders[split]
-                    name = f"{prefix}_{number:06d}"
+                    composition.image.save(out / f"{prefix}_{number:06d}.png")
                     number += 1
-                    composition.image.save(images_dir / f"{name}.png")
-                    atomic_write(labels_dir / f"{name}.txt",
-                                 encode(composition.boxes, *target.image.size))
-                    writer.writerow({
-                        "image": (images_dir / f"{name}.png").relative_to(out).as_posix(),
-                        "split": split or "", "code": code.name, "background": target.name,
-                        "mode": mode, "variant": variant, "seed": plan.seed})
-                    handle.flush()
                     made += 1
                     done += 1
-                    result.split_counts[split or "all"] = result.split_counts.get(
-                        split or "all", 0) + 1
                     if progress is not None and progress(
                             done, total, f"{code.stem} × {target.stem} · {mode}: "
                                          f"{variant + 1}/{count}") is False:
@@ -1781,31 +1855,9 @@ def run_batch(plan, out, generator=None, progress=None):
                 result.failures.append(f"{code.stem} × {target.stem} · {mode}: {exc}")
                 done += count - made
             result.made[mode] = result.made.get(mode, 0) + made
-        write_dataset_metadata(out, split_layout)
-        write_out_lines_index(out, plan)
-        append_export_log(out, plan, result)
     except OSError as exc:
         result.error = str(exc)
-    finally:
-        if handle is not None:
-            handle.close()
     return result
-
-
-def append_export_log(out, plan, result):
-    pairs = sorted({(pair.code.name, pair.target.name) for pair, _mode, _count in plan.tasks()})
-    line = "\t".join([
-        f"{datetime.now():%Y-%m-%d %H:%M:%S}", f"seed={plan.seed}",
-        f"count={plan.settings.count}", f"count_mode={plan.settings.count_mode}",
-        f"val={plan.settings.val_percent}%", f"split_by={plan.split_by or '-'}",
-        f"size={plan.settings.size_mode}",
-        f"angle=±{plan.settings.angle_jitter_deg:g}°",
-        "pairs=" + ";".join(f"{code}+{background}" for code, background in pairs),
-        ",".join(f"{name}={made}" for name, made in result.made.items()),
-        f"resumed={result.resumed}" + (" cancelled" if result.cancelled else ""),
-    ])
-    with open(out / "export_log.txt", "a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
 
 
 # --------------------------------------------------------------- contact sheet

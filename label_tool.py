@@ -18,13 +18,14 @@ from PIL import Image, ImageDraw, ImageTk
 from label_obb import Box, atomic_write, decode, encode, normalize_angle
 from synth_engine import (  # noqa: F401  (re-exported for scripts and tests)
     AUTO_ERROR_MODES, CONFIRM_ABOVE, CUT_SIDES, EFFECT_MODES, IMAGE_EXTENSIONS,
-    JITTER_ANGLE, JITTER_ANGLE_DEG, JITTER_SHIFT, MAX_ATTEMPTS, MAX_JITTER_ANGLE_DEG, STATE_VERSION, BatchSettings, Code,
+    JITTER_ANGLE, JITTER_ANGLE_DEG, JITTER_SHIFT, MAX_ATTEMPTS, MAX_BEND_PERCENT,
+    MAX_JITTER_ANGLE_DEG, MAX_SHIFT_PERCENT, STATE_VERSION, BatchSettings, Code,
     Composition, Generator, Job, Target, all_mode_names, auto_job_name, box_inside_box,
     character_asset, clip_box_to_side, code_mode_problem, contact_sheet, default_state,
     encode_out_lines, erase_boxes, first_free_number, image_files, image_to_local,
-    layout_conflict, layout_boxes, line_crosses_box, line_side_mask, load_code, load_target,
+    layout_boxes, line_crosses_box, line_side_mask, load_code, load_target,
     local_to_image, normalize_state, oriented_line, out_line_hits, overlapping_boxes,
-    plan_batch, previous_split, propose_character_boxes, read_manifest, read_out_lines,
+    plan_batch, propose_character_boxes, read_out_lines,
     read_region, run_batch, scale_region,
     split_rows, state_to_json, state_uses_indices, task_rng, text_angle,
 )
@@ -221,9 +222,10 @@ class SyntheticLabelTool:
             "count_mode": settings.count_mode,
             "modes": settings.selected_modes(all_mode_names(self.saved_modes)),
             "modes_unchecked": settings.modes_off or [],
-            "val_percent": settings.val_percent,
             "size_mode": "region" if self.size_by_region.get() else "image",
             "angle_jitter_deg": settings.angle_jitter_deg,
+            "shift_percent": settings.shift_percent,
+            "bend_percent": settings.bend_percent,
         }
 
     def save_config(self):
@@ -293,6 +295,8 @@ class SyntheticLabelTool:
         # must start from the saved settings too.
         self.generator.size_mode = self.batch.size_mode
         self.generator.angle_jitter_deg = self.batch.angle_jitter_deg
+        self.generator.shift_percent = self.batch.shift_percent
+        self.generator.bend_percent = self.batch.bend_percent
         if "count" in data:
             self.export_count.set(self.batch.count)
 
@@ -2253,13 +2257,11 @@ class SyntheticLabelTool:
             targets.append(target)
         return codes, targets, errors
 
-    def build_plan(self, seed, out=None):
+    def build_plan(self, seed):
         codes, targets, errors = self.batch_inputs()
         self.batch.size_mode = self.generator.size_mode
         self.batch.count = read_int(self.export_count, 10, 1, 100000)
-        previous = previous_split(read_manifest(out)) if out is not None else None
-        plan = plan_batch(codes, targets, self.saved_modes, self.batch, seed,
-                          self.generator, previous)
+        plan = plan_batch(codes, targets, self.saved_modes, self.batch, seed, self.generator)
         plan.warnings.extend(f"Không đọc được {error}" for error in errors)
         return plan
 
@@ -2348,15 +2350,6 @@ class BatchDialog:
                                                         padx=(108, 0))
         row += 1
 
-        self.val = tk.IntVar(value=settings.val_percent)
-        label("Tập val:")
-        val = ttk.Frame(frame)
-        val.grid(row=row, column=1, sticky="w")
-        ttk.Spinbox(val, from_=0, to=90, textvariable=self.val, width=5).pack(side="left")
-        ttk.Label(val, text="%  tách theo code (0 % = images/ + labels/ phẳng như cũ)").pack(
-            side="left", padx=4)
-        row += 1
-
         label("Cỡ ký tự:")
         ttk.Checkbutton(frame, text="theo vùng (date cao 85 % vùng) thay vì theo tỉ lệ kích "
                                     "thước ảnh", variable=app.size_by_region,
@@ -2377,12 +2370,37 @@ class BatchDialog:
                               "cần vùng đặt rộng hơn)").pack(side="left")
         row += 1
 
+        def percent_row(title, variable, high, before, after):
+            label(title)
+            line = ttk.Frame(frame)
+            line.grid(row=row, column=1, sticky="w")
+            ttk.Label(line, text=before).pack(side="left")
+            spin = ttk.Spinbox(line, from_=0, to=high, increment=5, textvariable=variable,
+                               width=6)
+            spin.pack(side="left", padx=4)
+            default = float(variable.get())
+            spin.bind("<FocusOut>", lambda _event: variable.set(
+                f"{read_float(variable, default, 0, high):g}"))
+            ttk.Label(line, text=after).pack(side="left")
+
+        self.shift = tk.StringVar(value=f"{settings.shift_percent:g}")
+        percent_row("Lệch vị trí:", self.shift, MAX_SHIFT_PERCENT, "ngẫu nhiên tới",
+                    "% khoảng trống trong vùng đặt (0 = chỉ quanh tâm vùng như cũ; "
+                    "100 = date nằm bất kỳ đâu trong vùng)")
+        row += 1
+
+        self.bend = tk.StringVar(value=f"{settings.bend_percent:g}")
+        percent_row("Uốn cong:", self.bend, MAX_BEND_PERCENT, "ngẫu nhiên ±",
+                    "% chiều cao ký tự (0 = tắt; áp cho mọi dạng lỗi, cùng chiều "
+                    "với lỗi arc)")
+        row += 1
+
         label("Seed:")
         seed = ttk.Frame(frame)
         seed.grid(row=row, column=1, sticky="w")
         ttk.Entry(seed, textvariable=app.seed_text, width=14).pack(side="left")
-        ttk.Label(seed, text="trống = ngẫu nhiên; cùng seed + cùng thư mục → chạy tiếp "
-                             "phần còn thiếu").pack(side="left", padx=4)
+        ttk.Label(seed, text="trống = ngẫu nhiên; cùng seed → cùng ảnh").pack(
+            side="left", padx=4)
         row += 1
 
         label("Thư mục:")
@@ -2404,8 +2422,9 @@ class BatchDialog:
                               ("Tạo", self.run), ("Đóng", self.close)):
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=3)
 
-        for variable in (self.pairing, self.limit_on, self.limit, self.count_mode, self.val,
-                         self.angle, app.export_count, *self.mode_vars.values()):
+        for variable in (self.pairing, self.limit_on, self.limit, self.count_mode,
+                         self.angle, self.shift, self.bend, app.export_count,
+                         *self.mode_vars.values()):
             variable.trace_add("write", lambda *_args: self.schedule_refresh())
         self.refresh()
 
@@ -2417,7 +2436,6 @@ class BatchDialog:
         settings.max_backgrounds_per_code = (
             read_int(self.limit, 3, 1, 10000) if self.limit_on.get() else 0)
         settings.count_mode = self.count_mode.get()
-        settings.val_percent = read_int(self.val, 20, 0, 90)
         settings.count = read_int(self.app.export_count, 10, 1, 100000)
         settings.modes_off = [name for name, variable in self.mode_vars.items()
                               if not variable.get()]
@@ -2426,6 +2444,12 @@ class BatchDialog:
         settings.angle_jitter_deg = read_float(self.angle, settings.angle_jitter_deg,
                                                0.0, MAX_JITTER_ANGLE_DEG)
         self.app.generator.angle_jitter_deg = settings.angle_jitter_deg
+        settings.shift_percent = read_float(self.shift, settings.shift_percent,
+                                            0.0, MAX_SHIFT_PERCENT)
+        settings.bend_percent = read_float(self.bend, settings.bend_percent,
+                                           0.0, MAX_BEND_PERCENT)
+        self.app.generator.shift_percent = settings.shift_percent
+        self.app.generator.bend_percent = settings.bend_percent
         return settings
 
     def schedule_refresh(self):
@@ -2439,9 +2463,9 @@ class BatchDialog:
         except tk.TclError:
             self._pending = None
 
-    def plan(self, seed, out=None):
+    def plan(self, seed):
         self.read_settings()
-        return self.app.build_plan(seed, out)
+        return self.app.build_plan(seed)
 
     def refresh(self):
         self._pending = None
@@ -2481,8 +2505,7 @@ class BatchDialog:
             seed = int(self.app.seed_text.get().strip() or 0)
         except ValueError:
             seed = 0
-        out = self.app.synthetic_target()
-        plan = self.plan(seed, out)
+        plan = self.plan(seed)
         window = tk.Toplevel(self.window)
         window.title("Kiểm tra: cặp × dạng lỗi")
         window.geometry("1400x520")
@@ -2512,17 +2535,7 @@ class BatchDialog:
         xscroll = ttk.Scrollbar(window, orient="horizontal", command=tree.xview)
         yscroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
         tree.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
-        lines = []
-        if plan.split_by:
-            val = sorted(name for name, split in plan.split.items() if split == "val")
-            train = sorted(name for name, split in plan.split.items() if split == "train")
-            if plan.split_by in ("code", "background"):
-                lines.append(f"Tách theo {plan.split_by}: val = {', '.join(val) or '—'}"
-                             f" | train = {', '.join(train) or '—'}")
-            else:
-                lines.append("Tách val ngẫu nhiên theo ảnh")
-        else:
-            lines.append("Không tách val (dạng phẳng images/ + labels/)")
+        lines = ["Chỉ xuất ảnh .png vào thư mục xuất (không label)."]
         lines.extend(plan.warnings)
         ttk.Label(window, text="\n".join(lines), padding=6, wraplength=1250).pack(
             side="bottom", fill="x")
@@ -2539,7 +2552,7 @@ class BatchDialog:
         out = app.synthetic_target()
         if out is None:
             return
-        plan = self.plan(seed, out)
+        plan = self.plan(seed)
         if not plan.total:
             messagebox.showinfo("Xem trước", "Không có ảnh nào để tạo — bấm Kiểm tra để xem "
                                 "lý do.", parent=self.window)
@@ -2570,25 +2583,13 @@ class BatchDialog:
         app = self.app
         if app.busy:
             return
-        seed_was_blank = not app.seed_text.get().strip()
         seed = app.export_seed()
         if seed is None:
             return
         out = app.synthetic_target()
         if out is None:
             return
-        settings = self.read_settings()
-        while True:
-            conflict = layout_conflict(out, settings.val_percent)
-            if conflict is None:
-                break
-            if not messagebox.askyesno("Thư mục đã có data khác dạng",
-                                       conflict + "\n\nChọn thư mục mới?", parent=self.window):
-                return
-            if not app.choose_synthetic_output(self.window):
-                return
-            out = app.synthetic_target()
-        plan = self.plan(seed, out)
+        plan = self.plan(seed)
         if not plan.total:
             messagebox.showerror("Không có ảnh để tạo",
                                  "Không cặp/dạng lỗi nào dùng được — bấm Kiểm tra để xem lý do."
@@ -2614,24 +2615,15 @@ class BatchDialog:
             progress.close()
             app.progress = None
             app.busy = False
-        if result.cancelled and seed_was_blank:
-            # Resuming needs the same seed.
-            app.seed_text.set(str(seed))
         app.save_config()
         if app.close_requested:
             app.close()
             return
         app.show_preview()
-        lines = [f"Đã ghi {result.total} ảnh và label tại:\n{out}", f"Seed: {seed}"]
-        if result.resumed:
-            lines.append(f"Bỏ qua {result.resumed} ảnh đã có từ lần chạy trước (cùng seed).")
-        if result.split_counts:
-            lines.append("Theo tập: " + ", ".join(f"{split}={count}" for split, count
-                                                  in sorted(result.split_counts.items())))
+        lines = [f"Đã ghi {result.total} ảnh tại:\n{out}", f"Seed: {seed}"]
         lines.append("\n".join(f"  {name}: {made}" for name, made in result.made.items()))
         if result.cancelled:
-            lines.append(f"Đã hủy giữa chừng. Bấm Tạo lại với seed {seed} và cùng thư mục "
-                         "để chạy tiếp phần còn thiếu.")
+            lines.append("Đã hủy giữa chừng; các ảnh đã ghi vẫn được giữ.")
         if plan.warnings:
             lines.append("\n".join(plan.warnings))
         if result.failures:
@@ -2685,6 +2677,12 @@ def run_batch_cli(argv=None):
     parser.add_argument("--count", type=int, help="số ảnh (mặc định: theo cấu hình)")
     parser.add_argument("--angle", type=float,
                         help="góc xoay ngẫu nhiên ± độ (mặc định: theo cấu hình)")
+    parser.add_argument("--shift", type=float,
+                        help="lệch vị trí tới N %% khoảng trống trong vùng đặt, 0–100 "
+                             "(mặc định: theo cấu hình)")
+    parser.add_argument("--bend", type=float,
+                        help="uốn cong ngẫu nhiên ± N %% chiều cao ký tự, 0–100 "
+                             "(mặc định: theo cấu hình)")
     parser.add_argument("--check", action="store_true", help="chỉ in bảng kiểm tra, không tạo ảnh")
     args = parser.parse_args(argv)
     config_path = Path(args.config)
@@ -2695,6 +2693,10 @@ def run_batch_cli(argv=None):
         settings.count = max(1, args.count)
     if args.angle is not None and math.isfinite(args.angle):
         settings.angle_jitter_deg = max(0.0, min(MAX_JITTER_ANGLE_DEG, args.angle))
+    if args.shift is not None and math.isfinite(args.shift):
+        settings.shift_percent = max(0.0, min(MAX_SHIFT_PERCENT, args.shift))
+    if args.bend is not None and math.isfinite(args.bend):
+        settings.bend_percent = max(0.0, min(MAX_BEND_PERCENT, args.bend))
     saved_modes = []
     for item in data.get("saved_modes", []) or []:
         try:
@@ -2729,9 +2731,9 @@ def run_batch_cli(argv=None):
         seed = int(text) if text.lstrip("-").isdigit() else random.SystemRandom().randrange(2 ** 31)
     out = Path(args.out or data.get("synthetic_output_dir") or OUTPUT_ROOT).resolve()
     generator = Generator.from_settings(settings)
-    plan = plan_batch(codes, targets, saved_modes, settings, seed, generator,
-                      previous_split(read_manifest(out)))
-    print(f"seed={seed}  out={out}  angle=±{settings.angle_jitter_deg:g}°")
+    plan = plan_batch(codes, targets, saved_modes, settings, seed, generator)
+    print(f"seed={seed}  out={out}  angle=±{settings.angle_jitter_deg:g}°  "
+          f"shift={settings.shift_percent:g}%  bend=±{settings.bend_percent:g}%")
     for pair in plan.pairs:
         name = f"{pair.code.stem} × {pair.target.stem}"
         if pair.problem:
@@ -2746,10 +2748,6 @@ def run_batch_cli(argv=None):
     print(f"Dự kiến {images} ảnh · ~{size / 1e6:.0f} MB · ~{_duration(seconds)}")
     if args.check or not images:
         return 0 if images else 1
-    conflict = layout_conflict(out, settings.val_percent)
-    if conflict:
-        print("LỖI:", conflict, file=sys.stderr)
-        return 2
     last = [0.0]
 
     def report(done, total, text):
@@ -2761,10 +2759,9 @@ def run_batch_cli(argv=None):
     try:
         result = run_batch(plan, out, generator, report)
     except KeyboardInterrupt:
-        print(f"Đã dừng. Chạy lại với --seed {seed} để tiếp tục.", file=sys.stderr)
+        print("Đã dừng; các ảnh đã ghi vẫn được giữ.", file=sys.stderr)
         return 130
-    print(f"Đã ghi {result.total} ảnh, bỏ qua {result.resumed} ảnh đã có. "
-          + ", ".join(f"{split}={count}" for split, count in sorted(result.split_counts.items())))
+    print(f"Đã ghi {result.total} ảnh vào {out}")
     for failure in result.failures:
         print("LỖI:", failure, file=sys.stderr)
     if result.error:
