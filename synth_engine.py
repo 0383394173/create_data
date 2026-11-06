@@ -20,7 +20,7 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from label_obb import Box, decode
 
@@ -53,6 +53,16 @@ ROTATION_ERROR_SPAN_DEG = 30.0
 SHIFT_ERROR_GAP = .25
 MAX_ATTEMPTS = 100
 MIN_PRINT_CONTRAST = 10  # grey levels between paper and ink
+# Print/paper separation (character_asset). Gate levels are fractions of the
+# paper-to-ink contrast below the paper: lighter than START is paper, darker
+# than END is ink, in between is a soft edge.
+GATE_START, GATE_END = .15, .30
+GATE_NOISE = 3.0     # the gate starts at least this many paper-noise σ below the paper
+GATE_SEED = .5       # a kept blob must have pixels this far towards the ink level
+MIN_SEED_PIXELS = 3  # ... and at least this many of them
+PAPER_FIT_ROUNDS = 3  # refits of the paper lighting surface
+PAPER_CLOSE_SIZE = .4    # first lighting guess: closing size, × box short side
+PAPER_LOCAL_SIGMA = .15  # local lighting detail: blur σ, × box short side
 REGION_FILL = .85        # "Cỡ ký tự theo vùng": date fills this much of the region
 # Measured on 1920x480 exports: about 0.44 MB and 60 ms per image.
 BYTES_PER_PIXEL = .44e6 / (1920 * 480)
@@ -130,16 +140,91 @@ def otsu_threshold(image, mask):
     return best_threshold
 
 
-def print_is_light(gray, roi):
+def print_is_light(gray, roi, sigma=4.0):
     """Return True when the print is lighter than the paper around the box.
 
-    The thin ring just outside the OBB is almost entirely paper, so its median
-    tells which side of the Otsu split inside the box is the paper.
+    The thin ring just outside the OBB is almost entirely paper. Each ring
+    pixel is compared with the average of the box pixels next to it (paper
+    and print mixed): paper brighter than that mix means dark print. The
+    comparison is local, so a shadow or gradient across the box cannot flip
+    it, and it treats both polarities alike.
     """
+    import cv2
+    import numpy as np
+
     ring = ImageChops.subtract(roi.filter(ImageFilter.MaxFilter(7)), roi)
     if not ring.getbbox() or not roi.getbbox():
         return False
-    return ImageStat.Stat(gray, ring).median[0] <= otsu_threshold(gray, roi)
+    values = np.asarray(gray, np.float32)
+    inside = (np.asarray(roi) > 0).astype(np.float32)
+    nearby = (cv2.GaussianBlur(values * inside, (0, 0), sigma)
+              / np.maximum(cv2.GaussianBlur(inside, (0, 0), sigma), 1e-3))
+    ring = np.asarray(ring) > 0
+    return float(np.median(values[ring] - nearby[ring])) < 0
+
+
+def _otsu_values(values):
+    """Otsu threshold of a 1-D float array (any range)."""
+    import numpy as np
+
+    low, high = float(values.min()), float(values.max())
+    if high - low < 1e-6:
+        return high
+    counts, edges = np.histogram(values, bins=256, range=(low, high))
+    centers = (edges[:-1] + edges[1:]) / 2
+    weight = np.cumsum(counts)
+    total = weight[-1]
+    cumulative = np.cumsum(counts * centers)
+    below, above = weight[:-1], total - weight[:-1]
+    valid = (below > 0) & (above > 0)
+    if not valid.any():
+        return high
+    mean_below = cumulative[:-1] / np.maximum(below, 1)
+    mean_above = (cumulative[-1] - cumulative[:-1]) / np.maximum(above, 1)
+    variance = np.where(valid, below * above * (mean_below - mean_above) ** 2, -1)
+    return float(edges[1:-1][int(np.argmax(variance))])
+
+
+def _paper_surface(gray, paper, sigma):
+    """Paper brightness under every pixel, estimated from the ``paper`` pixels.
+
+    A least-squares quadratic gives the broad gradient/vignette; a Gaussian
+    average of the paper's residual (normalised by how much paper is near)
+    adds local detail such as a shadow edge. Where little paper is near, the
+    local term fades out and the quadratic is used alone, so a large ink area
+    never pulls the surface down.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = gray.shape
+    y, x = np.mgrid[0:height, 0:width].astype(np.float32)
+    x = (x - width / 2) / max(1.0, width / 2)
+    y = (y - height / 2) / max(1.0, height / 2)
+    terms = np.stack([np.ones_like(x), x, y, x * x, x * y, y * y], axis=-1)
+    coefficients = np.linalg.lstsq(terms[paper], gray[paper], rcond=None)[0]
+    broad = terms @ coefficients
+    weight = paper.astype(np.float32)
+    residual = cv2.GaussianBlur((gray - broad) * weight, (0, 0), sigma)
+    support = cv2.GaussianBlur(weight, (0, 0), sigma)
+    return np.maximum(broad + residual / np.maximum(support, .25), 1.0)
+
+
+def _initial_ink(gray, kernel):
+    """First ink guess: pixels well below a grey closing of the crop.
+
+    The closing removes dark detail narrower than ``kernel`` (the strokes)
+    but keeps wider brightness changes such as a shadow edge, so this guess
+    is already free of lighting.
+    """
+    import cv2
+    import numpy as np
+
+    smooth = cv2.medianBlur(gray.astype(np.uint8), 3).astype(np.float32)
+    shape = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel))
+    paper = np.maximum(cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, shape), 1.0)
+    flat = gray / paper
+    return flat <= _otsu_values(flat)
 
 
 def character_asset(source, box, padding=12):
@@ -151,7 +236,16 @@ def character_asset(source, box, padding=12):
     True; the caller must then blend on the inverted background. ``shade`` is
     None when no print can be separated from the paper, so the caller never
     labels an object that would be invisible.
+
+    Steps: the paper brightness across the crop is modelled as a smooth
+    surface and divided out, so a gradient or vignette is not taken for ink.
+    Otsu then splits ink from paper, the soft gate keeps pixels clearly
+    darker than the paper noise, and only blobs that contain real ink
+    (hysteresis) survive, which drops stray paper specks and shadows.
     """
+    import cv2
+    import numpy as np
+
     corners = box.corners()
     left = max(0, math.floor(min(x for x, _ in corners)) - padding)
     top = max(0, math.floor(min(y for _, y in corners)) - padding)
@@ -162,7 +256,11 @@ def character_asset(source, box, padding=12):
     polygon = [(x - left, y - top) for x, y in corners]
     roi = Image.new("L", crop.size, 0)
     ImageDraw.Draw(roi).polygon(polygon, fill=255)
-    inverted = print_is_light(gray, roi)
+    # Scales follow the box's short side, which is about one character size.
+    size = min(box.w, box.h)
+    kernel = max(5, round(size * PAPER_CLOSE_SIZE) | 1)
+    sigma = max(2.0, size * PAPER_LOCAL_SIGMA)
+    inverted = print_is_light(gray, roi, sigma / 2)
     if inverted:
         crop, gray = ImageOps.invert(crop), ImageOps.invert(gray)
     # Ignore two pixels next to the OBB edge, where label borders or shadows
@@ -170,32 +268,74 @@ def character_asset(source, box, padding=12):
     inner = roi.filter(ImageFilter.MinFilter(5))
     if inner.getbbox():
         roi = inner
-    threshold = otsu_threshold(gray, roi)
-    paper_mask = ImageChops.multiply(
-        gray.point([0 if value <= threshold else 255 for value in range(256)]), roi)
-    ink_mask = ImageChops.multiply(
-        gray.point([255 if value <= threshold else 0 for value in range(256)]), roi)
-    if not paper_mask.getbbox() or not ink_mask.getbbox():
-        return None, (left, top), inverted
-    paper = ImageStat.Stat(crop, paper_mask).mean
-    paper_level = ImageStat.Stat(gray, paper_mask).mean[0]
-    ink_level = ImageStat.Stat(gray, ink_mask).mean[0]
-    if paper_level - ink_level < MIN_PRINT_CONTRAST:
-        return None, (left, top), inverted
-    shade = Image.merge("RGB", [
-        channel.point([min(255, round(value * 255 / max(1.0, level)))
-                       for value in range(256)])
-        for channel, level in zip(crop.split(), paper)])
-    # The soft gate only removes paper noise. The actual darkness comes from
-    # shade, preserving dot texture and anti-aliased print edges.
+    nothing = None, (left, top), inverted
+    inside = np.asarray(roi) > 0
+    if not inside.any():
+        return nothing
+    values = np.asarray(gray, np.float32)
+    rgb = np.asarray(crop, np.float32)
+
+    # Flatten the lighting: estimate the paper surface, split ink from paper
+    # on the flattened crop, and refit on the new paper pixels. The whole
+    # padded crop is used, so paper around the box steadies the surface.
+    margin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    ink = _initial_ink(values, kernel)
+    for _ in range(PAPER_FIT_ROUNDS):
+        # Leave the ink's soft edge out of the fit, or it darkens the paper.
+        paper = ~cv2.dilate(ink.astype(np.uint8), margin).astype(bool)
+        if paper.sum() < 12:
+            return nothing
+        surface = _paper_surface(values, paper, sigma)
+        flat = values / surface
+        ink = flat <= _otsu_values(flat[inside])
+        # Bright outliers (glare, specks) must not lift the surface either.
+        paper_values = flat[~ink & inside]
+        if paper_values.size:
+            middle = np.median(paper_values)
+            spread = 1.4826 * np.median(np.abs(paper_values - middle)) + 1e-6
+            ink |= flat > middle + 4 * spread
+
+    paper_mask, ink_mask = inside & ~ink, inside & (flat <= _otsu_values(flat[inside]))
+    if not paper_mask.any() or not ink_mask.any():
+        return nothing
+    paper_level = float(flat[paper_mask].mean())
+    ink_level = float(flat[ink_mask].mean())
     contrast = paper_level - ink_level
-    start, end = paper_level - contrast * .15, paper_level - contrast * .3
-    table = [255 if value <= end else 0 if value >= start
-             else round((start - value) * 255 / (start - end)) for value in range(256)]
-    gate = gray.point(table).filter(ImageFilter.MaxFilter(3))
-    gate = ImageChops.multiply(gate.filter(ImageFilter.GaussianBlur(.6)), roi)
+    if contrast * float(surface[inside].mean()) < MIN_PRINT_CONTRAST:
+        return nothing
+    noise = 1.4826 * float(np.median(np.abs(flat[paper_mask] - np.median(flat[paper_mask]))))
+
+    # shade: each channel divided by the local paper colour, so the sample's
+    # own lighting does not travel with the print onto the new background.
+    channel_flat = rgb / surface[..., None]
+    paper_colour = channel_flat[paper_mask].mean(axis=0)
+    shade = np.minimum(255.0, channel_flat / np.maximum(paper_colour, 1e-6) * 255)
+
+    # The soft gate only removes paper. Its start stays a few noise σ below
+    # the paper so grain is never kept, even when the print is faint.
+    gap_start = min(max(GATE_START * contrast, GATE_NOISE * noise), .5 * contrast)
+    gap_end = min(max(GATE_END * contrast, gap_start + (GATE_END - GATE_START) * contrast),
+                  .8 * contrast)
+    start, end = paper_level - gap_start, paper_level - gap_end
+    gate = np.clip((start - flat) / max(start - end, 1e-6), 0, 1) * inside
+    # Hysteresis: keep a blob only if part of it is as dark as real ink.
+    seeds = (flat <= paper_level - max(GATE_SEED * contrast, gap_end)) & inside
+    count, labels = cv2.connectedComponents((gate > 0).astype(np.uint8), connectivity=8)
+    if count <= 1 or not seeds.any():
+        return nothing
+    seed_pixels = np.bincount(labels[seeds], minlength=count)
+    keep = seed_pixels >= MIN_SEED_PIXELS
+    keep[0] = False
+    gate = gate * keep[labels]
+
+    # The darkness itself comes from shade, preserving dot texture and
+    # anti-aliased edges; the gate is just widened and softened a little.
+    gate = Image.fromarray(np.round(gate * 255).astype(np.uint8))
+    gate = gate.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(.6))
+    gate = ImageChops.multiply(gate, roi)
     if not gate.getbbox():
-        return None, (left, top), inverted
+        return nothing
+    shade = Image.fromarray(np.round(shade).astype(np.uint8), "RGB")
     white = Image.new("RGB", crop.size, (255, 255, 255))
     return Image.composite(shade, white, gate), (left, top), inverted
 
